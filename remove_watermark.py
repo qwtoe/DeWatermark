@@ -4,6 +4,7 @@ ProPainter 视频去水印工具
 """
 
 import os
+import re
 import sys
 import gc
 import subprocess
@@ -73,7 +74,6 @@ def extract_frames(
         raise RuntimeError(f"无法读取视频文件: {video_path}")
 
     # 解析分辨率
-    import re
     res_match = re.search(r'(\d{2,5})x(\d{2,5})', stderr)
     if not res_match:
         raise RuntimeError(f"无法解析视频分辨率: {video_path}")
@@ -208,6 +208,383 @@ def load_or_generate_mask(
             return mask
 
     return generate_mask(first_frame_path, mask_path, width, height)
+
+
+# ============================================================
+# ProPainter 模型加载模块
+# ============================================================
+
+PROPAINTER_REPO_URL = "https://github.com/sczhou/ProPainter.git"
+PROPAINTER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ProPainter")
+PRETRAIN_URL_BASE = "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/"
+
+WEIGHT_FILES = {
+    "raft-things.pth": "RAFT 光流模型",
+    "recurrent_flow_completion.pth": "循环流补全模型",
+    "ProPainter.pth": "ProPainter 修复模型",
+}
+
+
+def ensure_propainter() -> str:
+    """
+    确保 ProPainter 源码存在，如不存在则自动 git clone。
+    返回 ProPainter 目录路径。
+    """
+    if os.path.exists(os.path.join(PROPAINTER_DIR, "inference_propainter.py")):
+        print(f"ProPainter 源码已存在: {PROPAINTER_DIR}")
+        return PROPAINTER_DIR
+
+    print(f"首次运行，正在下载 ProPainter 源码...")
+    print(f"源: {PROPAINTER_REPO_URL}")
+
+    git_path = shutil.which("git")
+    if git_path:
+        cmd = [git_path, "clone", "--depth", "1", PROPAINTER_REPO_URL, PROPAINTER_DIR]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            print("ProPainter 源码下载完成。")
+            return PROPAINTER_DIR
+        except subprocess.CalledProcessError as e:
+            print(f"Git clone 失败: {e.stderr}")
+
+    raise RuntimeError(
+        "无法下载 ProPainter 源码。请手动执行:\n"
+        f"  git clone --depth 1 {PROPAINTER_REPO_URL} \"{PROPAINTER_DIR}\""
+    )
+
+
+def download_weights(weights_dir: str, force: bool = False) -> dict:
+    """
+    下载 ProPainter 预训练权重文件。
+    返回 {name: path} 字典。
+    """
+    import requests
+
+    os.makedirs(weights_dir, exist_ok=True)
+    weight_paths = {}
+
+    for fname, desc in WEIGHT_FILES.items():
+        local_path = os.path.join(weights_dir, fname)
+        if os.path.exists(local_path) and not force:
+            print(f"  [已存在] {fname} ({desc})")
+            weight_paths[fname] = local_path
+            continue
+
+        url = PRETRAIN_URL_BASE + fname
+        print(f"  下载 {fname} ({desc})...")
+        print(f"    {url}")
+
+        try:
+            resp = requests.get(url, stream=True, timeout=300)
+            resp.raise_for_status()
+            total = int(resp.headers.get("content-length", 0))
+
+            with open(local_path, "wb") as f:
+                with tqdm(total=total, unit="B", unit_scale=True, desc=f"    {fname}") as pbar:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+
+            weight_paths[fname] = local_path
+            print(f"    {fname} 下载完成。")
+        except Exception as e:
+            print(f"    下载 {fname} 失败: {e}")
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            raise RuntimeError(f"权重下载失败: {fname}\n请手动下载到 {weights_dir}/")
+
+    return weight_paths
+
+
+def load_propainter_models(
+    weights_dir: str = "weights",
+    use_fp16: bool = True,
+    device: str = "cuda",
+):
+    """
+    加载 ProPainter 三个核心模型，支持 FP16 半精度。
+
+    Returns:
+        (fix_raft, fix_flow_complete, model):
+            - fix_raft: RAFT_bi 光流模型 (FP32, RAFT用FP32更稳定)
+            - fix_flow_complete: RecurrentFlowCompleteNet
+            - model: InpaintGenerator (ProPainter 修复网络)
+    """
+    # 确保 ProPainter 源码可用
+    propainter_root = ensure_propainter()
+    if propainter_root not in sys.path:
+        sys.path.insert(0, propainter_root)
+
+    # 下载权重
+    weights_dir = os.path.join(PROPAINTER_DIR, "weights") if weights_dir == "weights" else weights_dir
+    weight_paths = download_weights(weights_dir)
+
+    device_obj = torch.device(device)
+    print(f"\n加载 ProPainter 模型到 {device_obj}...")
+
+    # 1. RAFT 光流模型 (保持 FP32，光流精度敏感)
+    print("  [1/3] 加载 RAFT 光流模型...")
+    from model.modules.flow_comp_raft import RAFT_bi
+    fix_raft = RAFT_bi(weight_paths["raft-things.pth"], device_obj)
+    fix_raft.eval()
+    print(f"    RAFT 加载完成 (FP32)")
+
+    # 2. 循环流补全网络
+    print("  [2/3] 加载循环流补全网络...")
+    from model.recurrent_flow_completion import RecurrentFlowCompleteNet
+    fix_flow_complete = RecurrentFlowCompleteNet(weight_paths["recurrent_flow_completion.pth"])
+    for p in fix_flow_complete.parameters():
+        p.requires_grad = False
+    fix_flow_complete.to(device_obj)
+    fix_flow_complete.eval()
+
+    # 3. ProPainter 修复网络
+    print("  [3/3] 加载 ProPainter 修复网络...")
+    from model.propainter import InpaintGenerator
+    model = InpaintGenerator(model_path=weight_paths["ProPainter.pth"]).to(device_obj)
+    model.eval()
+
+    # FP16 转换（RAFT 除外）
+    if use_fp16 and device != "cpu":
+        print("  启用 FP16 半精度...")
+        fix_flow_complete = fix_flow_complete.half()
+        model = model.half()
+    else:
+        print("  使用 FP32 全精度")
+
+    torch.cuda.empty_cache()
+    print(f"  模型加载完成。")
+
+    return fix_raft, fix_flow_complete, model
+
+
+def propainter_infer_chunk(
+    frames_tensor: torch.Tensor,
+    mask_tensor: torch.Tensor,
+    fix_raft,
+    fix_flow_complete,
+    model,
+    raft_iter: int = 20,
+    subvideo_length: int = 80,
+    use_fp16: bool = True,
+) -> torch.Tensor:
+    """
+    对一个小 chunk 的视频帧执行 ProPainter 推理。
+
+    Args:
+        frames_tensor: (1, T, 3, H, W) 归一化到 [-1, 1]
+        mask_tensor:  (1, T, 1, H, W) 二值mask
+        ...
+
+    Returns:
+        output: (1, T, 3, H, W) 修复后的帧
+    """
+    device = frames_tensor.device
+    video_length = frames_tensor.size(1)
+
+    with torch.no_grad():
+        # ---- 1. 计算光流 (RAFT 用 FP32) ----
+        if frames_tensor.size(-1) <= 640:
+            short_clip_len = 12
+        elif frames_tensor.size(-1) <= 720:
+            short_clip_len = 8
+        elif frames_tensor.size(-1) <= 1280:
+            short_clip_len = 4
+        else:
+            short_clip_len = 2
+
+        raft_input = frames_tensor.float()
+
+        if video_length > short_clip_len:
+            gt_flows_f_list, gt_flows_b_list = [], []
+            for f in range(0, video_length, short_clip_len):
+                end_f = min(video_length, f + short_clip_len)
+                if f == 0:
+                    flows_f, flows_b = fix_raft(raft_input[:, f:end_f], iters=raft_iter)
+                else:
+                    flows_f, flows_b = fix_raft(raft_input[:, f - 1:end_f], iters=raft_iter)
+
+                gt_flows_f_list.append(flows_f)
+                gt_flows_b_list.append(flows_b)
+                torch.cuda.empty_cache()
+
+            gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
+            gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
+            gt_flows_bi = (gt_flows_f, gt_flows_b)
+        else:
+            gt_flows_bi = fix_raft(raft_input, iters=raft_iter)
+            torch.cuda.empty_cache()
+
+        # ---- FP16 转换 ----
+        if use_fp16:
+            frames_tensor = frames_tensor.half()
+            mask_tensor = mask_tensor.half()
+            gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
+
+        # ---- 2. 流补全 ----
+        flow_length = gt_flows_bi[0].size(1)
+        if flow_length > subvideo_length:
+            pred_flows_f, pred_flows_b = [], []
+            pad_len = 5
+            for f in range(0, flow_length, subvideo_length):
+                s_f = max(0, f - pad_len)
+                e_f = min(flow_length, f + subvideo_length + pad_len)
+                pad_len_s = max(0, f) - s_f
+                pad_len_e = e_f - min(flow_length, f + subvideo_length)
+
+                pred_flows_bi_sub, _ = fix_flow_complete.forward_bidirect_flow(
+                    (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
+                    mask_tensor[:, s_f:e_f + 1]
+                )
+                pred_flows_bi_sub = fix_flow_complete.combine_flow(
+                    (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
+                    pred_flows_bi_sub,
+                    mask_tensor[:, s_f:e_f + 1]
+                )
+                pred_flows_f.append(pred_flows_bi_sub[0][:, pad_len_s:e_f - s_f - pad_len_e])
+                pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s:e_f - s_f - pad_len_e])
+                torch.cuda.empty_cache()
+
+            pred_flows_f = torch.cat(pred_flows_f, dim=1)
+            pred_flows_b = torch.cat(pred_flows_b, dim=1)
+            pred_flows_bi = (pred_flows_f, pred_flows_b)
+        else:
+            pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, mask_tensor)
+            pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, mask_tensor)
+            torch.cuda.empty_cache()
+
+        # ---- 3. 图像传播 ----
+        masked_frames = frames_tensor * (1 - mask_tensor)
+        subvideo_length_img_prop = min(100, subvideo_length)
+
+        if video_length > subvideo_length_img_prop:
+            updated_frames, updated_masks = [], []
+            pad_len = 10
+            for f in range(0, video_length, subvideo_length_img_prop):
+                s_f = max(0, f - pad_len)
+                e_f = min(video_length, f + subvideo_length_img_prop + pad_len)
+                pad_len_s = max(0, f) - s_f
+                pad_len_e = e_f - min(video_length, f + subvideo_length_img_prop)
+
+                pred_flows_bi_sub = (
+                    pred_flows_bi[0][:, s_f:e_f - 1],
+                    pred_flows_bi[1][:, s_f:e_f - 1],
+                )
+                prop_imgs_sub, updated_local_masks_sub = model.img_propagation(
+                    masked_frames[:, s_f:e_f],
+                    pred_flows_bi_sub,
+                    mask_tensor[:, s_f:e_f],
+                    "nearest",
+                )
+                updated_frames.append(prop_imgs_sub[:, pad_len_s:e_f - s_f - pad_len_e])
+                updated_masks.append(updated_local_masks_sub[:, pad_len_s:e_f - s_f - pad_len_e])
+                torch.cuda.empty_cache()
+
+            updated_frames = torch.cat(updated_frames, dim=1)
+            updated_masks = torch.cat(updated_masks, dim=1)
+        else:
+            updated_frames, updated_masks = model.img_propagation(
+                masked_frames, pred_flows_bi, mask_tensor, "nearest"
+            )
+            torch.cuda.empty_cache()
+
+        # ---- 4. 特征优化与输出 ----
+        # 使用 2 帧滑动窗口避免 OOM
+        if video_length > 2:
+            comp_frames_list = []
+            for i in range(video_length):
+                s_idx = max(0, i - 1)
+                e_idx = min(video_length, i + 2)
+                local_len = e_idx - s_idx
+                local_s = i - s_idx
+                local_e = local_s + 1
+
+                comp_frames_sub = model.transformer(
+                    updated_frames[:, s_idx:e_idx],
+                    updated_masks[:, s_idx:e_idx],
+                    pred_flows_bi[0][:, max(0, i - 1):min(video_length, i + 1)],
+                    pred_flows_bi[1][:, max(0, i - 1):min(video_length, i + 1)],
+                )
+                comp_frames_list.append(comp_frames_sub[:, local_s:local_e])
+                torch.cuda.empty_cache()
+            comp_frames = torch.cat(comp_frames_list, dim=1)
+        else:
+            comp_frames = model.transformer(
+                updated_frames, updated_masks,
+                pred_flows_bi[0], pred_flows_bi[1]
+            )
+            torch.cuda.empty_cache()
+
+    return comp_frames
+
+
+def preprocess_frames_for_propainter(
+    frame_paths: List[str],
+    mask: np.ndarray,
+    resize_to: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int], Tuple[int, int]]:
+    """
+    从磁盘读取帧并预处理为 ProPainter 输入格式。
+
+    Args:
+        frame_paths: 帧文件路径列表
+        mask: (H, W) 二值mask (255=水印区域)
+        resize_to: 可选，缩放到的短边尺寸 (如 480)
+
+    Returns:
+        (frames_tensor, mask_tensor, original_size, process_size)
+        frames_tensor: (1, T, 3, H, W) 归一化到 [-1, 1]
+        mask_tensor:  (1, T, 1, H, W) 二值
+    """
+    from PIL import Image
+
+    frames_pil = []
+    for p in frame_paths:
+        img = Image.open(p).convert("RGB")
+        frames_pil.append(img)
+
+    # 计算处理尺寸
+    orig_w, orig_h = frames_pil[0].size
+    original_size = (orig_w, orig_h)
+
+    if resize_to is not None:
+        scale = resize_to / min(orig_h, orig_w)
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        new_w = new_w - new_w % 8
+        new_h = new_h - new_h % 8
+        process_size = (new_w, new_h)
+    else:
+        new_w = orig_w - orig_w % 8
+        new_h = orig_h - orig_h % 8
+        process_size = (new_w, new_h)
+
+    # Resize 帧
+    resized_frames = []
+    for f in frames_pil:
+        if process_size != (orig_w, orig_h):
+            f = f.resize(process_size, Image.LANCZOS)
+        resized_frames.append(f)
+
+    # Resize mask
+    mask_img = Image.fromarray(mask)
+    if process_size != (orig_w, orig_h):
+        mask_img = mask_img.resize(process_size, Image.NEAREST)
+    mask_np = np.array(mask_img)
+
+    # 处理 mask: 膨胀 + 二值化
+    import scipy.ndimage
+    mask_dilated = scipy.ndimage.binary_dilation(mask_np > 128, iterations=4).astype(np.uint8) * 255
+
+    # 转为 tensor
+    from core.utils import to_tensors as to_tensors_fn
+    frames_t = to_tensors_fn()(resized_frames).unsqueeze(0) * 2.0 - 1.0  # (1,T,3,H,W)
+
+    # 创建 mask tensor
+    mask_imgs = [Image.fromarray(mask_dilated)] * len(resized_frames)
+    mask_t = to_tensors_fn()(mask_imgs).unsqueeze(0)  # (1,T,1,H,W)
+
+    return frames_t, mask_t, original_size, process_size
 
 
 def reconstruct_video(
