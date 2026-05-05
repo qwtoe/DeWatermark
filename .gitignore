@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+ProPainter/
+weights/
+*.pth
+temp_*/
