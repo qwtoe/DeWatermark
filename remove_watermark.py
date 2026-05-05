@@ -125,6 +125,91 @@ def extract_frames(
     return frame_paths, fps, (width, height), actual_count
 
 
+def generate_mask(
+    first_frame_path: str,
+    mask_path: str,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """
+    弹出窗口让用户在第一帧上框选水印位置，自动生成全黑底白字 Mask。
+
+    Args:
+        first_frame_path: 第一帧 JPEG 路径
+        mask_path: 保存 mask 的路径
+        width: 视频宽度
+        height: 视频高度
+
+    Returns:
+        mask: (H, W) 二值图，水印区域=255，其它=0
+    """
+    frame = cv2.imread(first_frame_path)
+    if frame is None:
+        raise RuntimeError(f"无法读取第一帧: {first_frame_path}")
+
+    print("\n" + "=" * 60)
+    print("请在弹出窗口中框选水印区域")
+    print("操作提示:")
+    print("  - 鼠标拖拽框选水印位置")
+    print("  - 按 SPACE/ENTER 确认当前选框")
+    print("  - 按 ESC 跳过（不处理）")
+    print("  - 可多次框选多个水印区域")
+    print("=" * 60 + "\n")
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    while True:
+        roi = cv2.selectROI("选择水印区域 - ESC结束", frame, showCrosshair=True, fromCenter=False)
+
+        if roi[2] == 0 or roi[3] == 0:
+            break
+
+        x, y, w, h = roi
+        mask[y:y + h, x:x + w] = 255
+        print(f"  已标记水印区域: x={x}, y={y}, w={w}, h={h}")
+
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+    cv2.destroyAllWindows()
+
+    if mask.max() == 0:
+        print("\nWARNING: 未选择任何水印区域，将跳过去水印处理")
+    else:
+        cv2.imwrite(mask_path, mask)
+        print(f"\nMask 已保存: {mask_path}")
+
+    return mask
+
+
+def load_or_generate_mask(
+    first_frame_path: str,
+    mask_path: str,
+    width: int,
+    height: int,
+    force_regenerate: bool = False,
+) -> np.ndarray:
+    """
+    加载已有 Mask 或通过交互框选生成新 Mask。
+
+    Args:
+        first_frame_path: 第一帧路径（生成新mask时需要）
+        mask_path: Mask 保存/加载路径
+        width: 视频宽度
+        height: 视频高度
+        force_regenerate: 强制重新生成
+
+    Returns:
+        mask: (H, W) 二值图
+    """
+    if os.path.exists(mask_path) and not force_regenerate:
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is not None:
+            print(f"已加载现有 Mask: {mask_path}")
+            return mask
+
+    return generate_mask(first_frame_path, mask_path, width, height)
+
+
 def reconstruct_video(
     frame_dir: str,
     output_path: str,
