@@ -587,6 +587,132 @@ def preprocess_frames_for_propainter(
     return frames_t, mask_t, original_size, process_size
 
 
+def _cleanup_memory(verbose: bool = False):
+    """三重内存清理：del引用 + gc.collect() + CUDA缓存清空"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    if verbose:
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"  [内存清理] 已分配: {alloc:.2f}GB, 已保留: {reserved:.2f}GB")
+
+
+def process_chunks(
+    frame_paths: List[str],
+    mask: np.ndarray,
+    output_dir: str,
+    fix_raft,
+    fix_flow_complete,
+    model,
+    chunk_size: int = 5,
+    resize_to: Optional[int] = None,
+    use_fp16: bool = True,
+    raft_iter: int = 20,
+    device: str = "cuda",
+) -> None:
+    """
+    Chunk 分块循环推理 — 核心内存管理函数。
+
+    每次只加载 chunk_size 帧到内存/显存，推理完成后：
+      1. del 释放所有中间 tensor
+      2. gc.collect() 回收 Python 内存
+      3. torch.cuda.empty_cache() 清空 CUDA 缓存
+
+    结果帧逐帧写入磁盘，绝不在内存中累积。
+
+    Args:
+        frame_paths: 所有帧路径列表
+        mask: (H, W) 二值mask
+        output_dir: 输出帧目录
+        fix_raft: RAFT 光流模型
+        fix_flow_complete: 流补全模型
+        model: ProPainter 修复模型
+        chunk_size: 每批处理帧数 (默认5，显存紧张可降到3)
+        resize_to: 降级分辨率 (如 480)
+        use_fp16: 半精度
+        raft_iter: RAFT 迭代次数 (默认20，可降到10节约时间)
+        device: 设备
+    """
+    total_frames = len(frame_paths)
+    device_obj = torch.device(device)
+    use_cuda = device_obj.type == "cuda"
+
+    print(f"\n{'=' * 60}")
+    print(f"Chunk 推理: 共 {total_frames} 帧, 每批 {chunk_size} 帧, ~{total_frames // chunk_size + 1} 批次")
+    if resize_to:
+        print(f"降级分辨率: {resize_to}p (推理后还原)")
+    print(f"FP16: {use_fp16}, GPU: {use_cuda}")
+    print(f"{'=' * 60}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 计算 chunk 范围
+    chunks = list(range(0, total_frames, chunk_size))
+    pbar = tqdm(total=total_frames, desc="推理进度", unit="帧")
+
+    for chunk_idx, start_idx in enumerate(chunks):
+        end_idx = min(start_idx + chunk_size, total_frames)
+        chunk_paths = frame_paths[start_idx:end_idx]
+
+        # ====== 步骤 1: 加载帧 + 预处理 ======
+        frames_tensor, mask_tensor, original_size, process_size = \
+            preprocess_frames_for_propainter(chunk_paths, mask, resize_to)
+
+        frames_tensor = frames_tensor.to(device_obj)
+        mask_tensor = mask_tensor.to(device_obj)
+
+        # ====== 步骤 2: ProPainter 推理 ======
+        with torch.inference_mode():
+            result_tensor = propainter_infer_chunk(
+                frames_tensor, mask_tensor,
+                fix_raft, fix_flow_complete, model,
+                raft_iter=raft_iter,
+                use_fp16=use_fp16,
+            )
+
+        # ====== 步骤 3: 后处理 + 写入磁盘 ======
+        # result_tensor: (1, T, 3, H, W) in [-1, 1]
+        result_np = result_tensor.squeeze(0).float().cpu().numpy()  # (T, 3, H, W)
+        result_np = (result_np + 1.0) / 2.0  # [-1,1] → [0,1]
+        result_np = np.clip(result_np * 255, 0, 255).astype(np.uint8)
+        result_np = result_np.transpose(0, 2, 3, 1)  # (T, H, W, 3)
+
+        # 如果推理时缩放了，还原回原始尺寸
+        if process_size != original_size:
+            resized_results = []
+            for i in range(result_np.shape[0]):
+                img = cv2.resize(result_np[i], original_size, interpolation=cv2.INTER_LANCZOS4)
+                resized_results.append(img)
+            result_np = np.stack(resized_results)
+
+        # 写入磁盘（RGB → BGR for OpenCV）
+        for local_idx, global_idx in enumerate(range(start_idx, end_idx)):
+            out_path = os.path.join(output_dir, f"frame_{global_idx:06d}.jpg")
+            cv2.imwrite(out_path, cv2.cvtColor(result_np[local_idx], cv2.COLOR_RGB2BGR))
+
+        # ====== 步骤 4: 三重内存清理 ======
+        del frames_tensor, mask_tensor, result_tensor, result_np, chunk_paths
+        _cleanup_memory(verbose=(chunk_idx % 10 == 0))
+
+        pbar.update(len(chunk_paths))
+
+        # 报告显存状态
+        if use_cuda and chunk_idx % 5 == 0:
+            mem_alloc = torch.cuda.memory_allocated() / 1024**3
+            mem_reserved = torch.cuda.memory_reserved() / 1024**3
+            pbar.set_postfix({
+                "显存": f"{mem_alloc:.1f}/{mem_reserved:.1f}GB",
+                "chunk": f"{chunk_idx + 1}/{len(chunks)}"
+            })
+
+    pbar.close()
+    print(f"\n推理完成! 输出帧: {output_dir}")
+    _cleanup_memory(verbose=True)
+
+
 def reconstruct_video(
     frame_dir: str,
     output_path: str,
