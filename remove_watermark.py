@@ -749,20 +749,194 @@ def reconstruct_video(
     print("视频生成完成。")
 
 
-if __name__ == "__main__":
+def cleanup_temp(*dirs: str) -> None:
+    """安全删除临时目录"""
+    for d in dirs:
+        if d and os.path.exists(d):
+            try:
+                shutil.rmtree(d)
+                print(f"  已清理: {d}")
+            except Exception as e:
+                print(f"  清理失败 {d}: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ProPainter 视频去水印 — 极限内存优化版 (适配 6GB 显存)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例:
+  # 基本用法
+  python remove_watermark.py -i video.mp4 -o output.mp4
+
+  # 如果爆显存，降分辨率到 480p
+  python remove_watermark.py -i video.mp4 -o output.mp4 --resize 480
+
+  # 进一步降低每批帧数
+  python remove_watermark.py -i video.mp4 -o output.mp4 --resize 480 --chunk-size 3
+
+  # 使用已有mask（跳过框选）
+  python remove_watermark.py -i video.mp4 -o output.mp4 --mask mask.png
+        """
+    )
+
+    # 核心参数
+    parser.add_argument("-i", "--input", required=True, help="输入视频路径")
+    parser.add_argument("-o", "--output", default="output_clean.mp4", help="输出视频路径 (默认: output_clean.mp4)")
+    parser.add_argument("-m", "--mask", default="mask.png", help="Mask 路径 (默认: mask.png，不存在则交互框选)")
+
+    # 降级策略参数
+    parser.add_argument("--resize", type=int, default=None,
+                        help="降级分辨率 (如 480 或 720)。推理时缩放至此尺寸，完成后还原。爆显存必用。")
+    parser.add_argument("--chunk-size", type=int, default=5,
+                        help="每批处理帧数 (默认5，显存紧张时降低到3)")
+    parser.add_argument("--raft-iter", type=int, default=20,
+                        help="RAFT 光流迭代次数 (默认20，可降至10加速)")
+
+    # 精度控制
+    parser.add_argument("--fp32", action="store_true",
+                        help="使用 FP32 全精度 (默认FP16，更省显存)")
+    parser.add_argument("--no-cuda", action="store_true",
+                        help="强制使用 CPU (极慢，最后手段)")
+
+    # 视频参数
+    parser.add_argument("--crf", type=int, default=18,
+                        help="输出视频质量 CRF (越小越好，默认18)")
+    parser.add_argument("--quality", type=int, default=95,
+                        help="JPEG 帧质量 1-100 (默认95)")
+
+    # 其他
+    parser.add_argument("--keep-temp", action="store_true",
+                        help="保留临时文件 (调试用)")
+    parser.add_argument("--force-mask", action="store_true",
+                        help="强制重新生成 Mask (忽略已有mask.png)")
+
+    args = parser.parse_args()
+
+    # ====== 环境检测 ======
     print("=" * 60)
     print("ProPainter 视频去水印工具 v1.0")
     print("=" * 60)
 
-    # 简单验证 FFmpeg
-    ffmpeg = get_ffmpeg_path()
-    print(f"FFmpeg: {ffmpeg}")
+    use_cuda = not args.no_cuda and torch.cuda.is_available()
+    device_str = "cuda" if use_cuda else "cpu"
+    use_fp16 = not args.fp32 and use_cuda
 
-    # 验证 CUDA
-    if torch.cuda.is_available():
+    print(f"FFmpeg: {get_ffmpeg_path()}")
+    if use_cuda:
         props = torch.cuda.get_device_properties(0)
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"显存: {props.total_mem / 1024**3:.1f} GB")
         print(f"CUDA: {torch.version.cuda}")
+        print(f"精度: {'FP16' if use_fp16 else 'FP32'}")
     else:
-        print("WARNING: CUDA 不可用，将使用 CPU (极慢)")
+        print("模式: CPU (极慢)")
+        print(f"精度: FP32")
+
+    if args.resize:
+        print(f"降级分辨率: {args.resize}p")
+    print(f"Chunk 大小: {args.chunk_size} 帧/批")
+
+    # ====== 检查输入 ======
+    if not os.path.exists(args.input):
+        print(f"ERROR: 输入视频不存在: {args.input}")
+        sys.exit(1)
+
+    # ====== 验证显存 ======
+    if use_cuda:
+        free_mem = (torch.cuda.get_device_properties(0).total_mem - torch.cuda.memory_allocated()) / 1024**3
+        print(f"可用显存: ~{free_mem:.1f} GB")
+        if free_mem < 2.0 and not args.resize:
+            print("\n*** WARNING: 可用显存不足 2GB，强烈建议使用 --resize 480 ***")
+        if free_mem < 1.0 and not args.resize:
+            print("\n*** ERROR: 显存严重不足，自动启用 --resize 480 ***")
+            args.resize = 480
+
+    # ====== 准备工作目录 ======
+    base_temp = tempfile.mkdtemp(prefix="propainter_")
+    frames_input_dir = os.path.join(base_temp, "frames_input")
+    frames_output_dir = os.path.join(base_temp, "frames_output")
+    os.makedirs(frames_input_dir, exist_ok=True)
+    os.makedirs(frames_output_dir, exist_ok=True)
+
+    print(f"\n临时目录: {base_temp}")
+
+    try:
+        # ====== 步骤 1: 抽帧 ======
+        print(f"\n[步骤 1/5] 提取视频帧...")
+        frame_paths, fps, (width, height), total_frames = extract_frames(
+            args.input, frames_input_dir, quality=args.quality
+        )
+
+        if total_frames == 0:
+            print("ERROR: 视频没有帧")
+            sys.exit(1)
+
+        # ====== 步骤 2: 生成/加载 Mask ======
+        print(f"\n[步骤 2/5] 准备水印 Mask...")
+        mask = load_or_generate_mask(
+            frame_paths[0], args.mask, width, height,
+            force_regenerate=args.force_mask
+        )
+
+        if mask.max() == 0:
+            print("WARNING: Mask 为空，水印区域未标记。将直接复制原始帧...")
+            # 直接复制帧到输出目录
+            import shutil as _shutil
+            for i, src in enumerate(frame_paths):
+                dst = os.path.join(frames_output_dir, f"frame_{i:06d}.jpg")
+                _shutil.copy2(src, dst)
+        else:
+            # ====== 步骤 3: 加载模型 ======
+            print(f"\n[步骤 3/5] 加载 ProPainter 模型...")
+            fix_raft, fix_flow_complete, model = load_propainter_models(
+                use_fp16=use_fp16,
+                device=device_str,
+            )
+
+            # ====== 步骤 4: Chunk 推理 ======
+            print(f"\n[步骤 4/5] 开始去水印推理...")
+            process_chunks(
+                frame_paths=frame_paths,
+                mask=mask,
+                output_dir=frames_output_dir,
+                fix_raft=fix_raft,
+                fix_flow_complete=fix_flow_complete,
+                model=model,
+                chunk_size=args.chunk_size,
+                resize_to=args.resize,
+                use_fp16=use_fp16,
+                raft_iter=args.raft_iter,
+                device=device_str,
+            )
+
+            # 释放模型
+            del fix_raft, fix_flow_complete, model
+            _cleanup_memory(verbose=True)
+            print("模型已释放")
+
+        # ====== 步骤 5: 合并视频 ======
+        print(f"\n[步骤 5/5] 合并帧为输出视频...")
+        reconstruct_video(frames_output_dir, args.output, fps, crf=args.crf)
+
+        print(f"\n{'=' * 60}")
+        print(f"✓ 完成! 输出视频: {args.output}")
+        print(f"{'=' * 60}")
+
+    except KeyboardInterrupt:
+        print("\n\n用户中断。正在清理...")
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # ====== 清理临时文件 ======
+        if not args.keep_temp:
+            print("\n清理临时文件...")
+            cleanup_temp(base_temp)
+        else:
+            print(f"\n临时文件保留在: {base_temp}")
+
+
+if __name__ == "__main__":
+    main()
