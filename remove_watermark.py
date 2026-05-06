@@ -1,6 +1,6 @@
 """
-ProPainter 视频去水印工具
-针对 NVIDIA CMP 30HX (6GB VRAM) / 8GB 系统内存 极限优化
+ClearFrame — Video Watermark Removal with ProPainter
+Extreme memory optimization for low-VRAM GPUs (tested on 6 GB).
 """
 
 import os
@@ -743,7 +743,7 @@ def cleanup_temp(*dirs: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ProPainter 视频去水印 — 极限内存优化版 (适配 6GB 显存)",
+        description="ClearFrame — Video Watermark Removal with ProPainter (VRAM ≥ 4 GB)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
@@ -816,7 +816,7 @@ def main():
 
     # ====== 环境检测 ======
     print("=" * 60)
-    print("ProPainter 视频去水印工具 v1.0")
+    print("ClearFrame v1.0 — ProPainter Video Watermark Removal")
     print("=" * 60)
 
     use_cuda = not args.no_cuda and torch.cuda.is_available()

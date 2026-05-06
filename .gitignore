@@ -5,3 +5,5 @@ ProPainter/
 weights/
 *.pth
 temp_*/
+mask.png
+*.mp4

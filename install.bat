@@ -1,6 +1,6 @@
 @echo off
 echo ============================================================
-echo   ProPainter Watermark Remover - Environment Setup
+echo   ClearFrame — Environment Setup
 echo   Target: NVIDIA CMP 30HX (6GB VRAM) / CUDA 13.1
 echo ============================================================
 echo.
