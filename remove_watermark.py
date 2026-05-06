@@ -1,5 +1,5 @@
 """
-ClearFrame — Video Watermark Removal with ProPainter
+DeWatermark — Video Watermark Removal with ProPainter
 Extreme memory optimization for low-VRAM GPUs (tested on 6 GB).
 """
 
@@ -743,7 +743,7 @@ def cleanup_temp(*dirs: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ClearFrame — Video Watermark Removal with ProPainter (VRAM ≥ 4 GB)",
+        description="DeWatermark — Video Watermark Removal with ProPainter (VRAM ≥ 4 GB)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
@@ -816,7 +816,7 @@ def main():
 
     # ====== 环境检测 ======
     print("=" * 60)
-    print("ClearFrame v1.0 — ProPainter Video Watermark Removal")
+    print("DeWatermark v1.0 — ProPainter Video Watermark Removal")
     print("=" * 60)
 
     use_cuda = not args.no_cuda and torch.cuda.is_available()

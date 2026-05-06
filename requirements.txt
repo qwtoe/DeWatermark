@@ -1,7 +1,7 @@
 # ============================================================
-# ProPainter 视频去水印 — 完整依赖清单
-# 已核实 ProPainter 所有 model/core/RAFT/utils 导入
-# 适配: NVIDIA CMP 30HX (6GB) / CUDA 13.1
+# DeWatermark - Video Watermark Removal
+# Verified imports for ProPainter core modules
+# Optimized for: NVIDIA CMP 30HX (6GB) / CUDA 13.1
 # ============================================================
 
 # --- PyTorch (CUDA版, 由 install.bat 单独安装) ---

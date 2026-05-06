@@ -1,6 +1,6 @@
 @echo off
 echo ============================================================
-echo   ClearFrame — Environment Setup
+echo   DeWatermark �?Environment Setup
 echo   Target: NVIDIA CMP 30HX (6GB VRAM) / CUDA 13.1
 echo ============================================================
 echo.
