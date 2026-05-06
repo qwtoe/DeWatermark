@@ -15,8 +15,11 @@ import subprocess
 import tempfile
 import shutil
 import argparse
+import warnings
 from pathlib import Path
 from typing import Tuple, List, Optional
+
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import cv2
@@ -473,67 +476,24 @@ def propainter_infer_chunk(
             pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, mask_tensor)
             torch.cuda.empty_cache()
 
-        # ---- 3. 图像传播 ----
+        # ---- 3. 图像传播 + 4. 特征优化（新版 ProPainter API）----
         masked_frames = frames_tensor * (1 - mask_tensor)
-        subvideo_length_img_prop = min(100, subvideo_length)
 
-        if video_length > subvideo_length_img_prop:
-            updated_frames, updated_masks = [], []
-            pad_len = 10
-            for f in range(0, video_length, subvideo_length_img_prop):
-                s_f = max(0, f - pad_len)
-                e_f = min(video_length, f + subvideo_length_img_prop + pad_len)
-                pad_len_s = max(0, f) - s_f
-                pad_len_e = e_f - min(video_length, f + subvideo_length_img_prop)
+        # 小 chunk 直接一次传播，不需要分段
+        updated_frames, updated_masks = model.img_propagation(
+            masked_frames, pred_flows_bi, mask_tensor, "nearest"
+        )
+        torch.cuda.empty_cache()
 
-                pred_flows_bi_sub = (
-                    pred_flows_bi[0][:, s_f:e_f - 1],
-                    pred_flows_bi[1][:, s_f:e_f - 1],
-                )
-                prop_imgs_sub, updated_local_masks_sub = model.img_propagation(
-                    masked_frames[:, s_f:e_f],
-                    pred_flows_bi_sub,
-                    mask_tensor[:, s_f:e_f],
-                    "nearest",
-                )
-                updated_frames.append(prop_imgs_sub[:, pad_len_s:e_f - s_f - pad_len_e])
-                updated_masks.append(updated_local_masks_sub[:, pad_len_s:e_f - s_f - pad_len_e])
-                torch.cuda.empty_cache()
-
-            updated_frames = torch.cat(updated_frames, dim=1)
-            updated_masks = torch.cat(updated_masks, dim=1)
-        else:
-            updated_frames, updated_masks = model.img_propagation(
-                masked_frames, pred_flows_bi, mask_tensor, "nearest"
-            )
-            torch.cuda.empty_cache()
-
-        # ---- 4. 特征优化与输出 ----
-        # 使用 2 帧滑动窗口避免 OOM
-        if video_length > 2:
-            comp_frames_list = []
-            for i in range(video_length):
-                s_idx = max(0, i - 1)
-                e_idx = min(video_length, i + 2)
-                local_len = e_idx - s_idx
-                local_s = i - s_idx
-                local_e = local_s + 1
-
-                comp_frames_sub = model.transformer(
-                    updated_frames[:, s_idx:e_idx],
-                    updated_masks[:, s_idx:e_idx],
-                    pred_flows_bi[0][:, max(0, i - 1):min(video_length, i + 1)],
-                    pred_flows_bi[1][:, max(0, i - 1):min(video_length, i + 1)],
-                )
-                comp_frames_list.append(comp_frames_sub[:, local_s:local_e])
-                torch.cuda.empty_cache()
-            comp_frames = torch.cat(comp_frames_list, dim=1)
-        else:
-            comp_frames = model.transformer(
-                updated_frames, updated_masks,
-                pred_flows_bi[0], pred_flows_bi[1]
-            )
-            torch.cuda.empty_cache()
+        # 新版 API: 通过 model() forward 完成 transformer + decoder
+        comp_frames = model(
+            masked_frames=masked_frames,
+            completed_flows=pred_flows_bi,
+            masks_in=mask_tensor,
+            masks_updated=updated_masks,
+            num_local_frames=video_length,
+        )
+        torch.cuda.empty_cache()
 
     return comp_frames
 
@@ -872,10 +832,6 @@ def main():
     else:
         print("模式: CPU (极慢)")
         print(f"精度: FP32")
-
-    if args.resize:
-        print(f"降级分辨率: {args.resize}p")
-    print(f"Chunk 大小: {args.chunk_size} 帧/批")
 
     # ====== 检查输入 ======
     if not os.path.exists(args.input):
