@@ -1,10 +1,10 @@
 # ============================================================
-# ProPainter 视频去水印 依赖清单
-# 针对 NVIDIA CMP 30HX (6GB) / CUDA 13.1 极限优化
+# ProPainter 视频去水印 — 完整依赖清单
+# 已核实 ProPainter 所有 model/core/RAFT/utils 导入
+# 适配: NVIDIA CMP 30HX (6GB) / CUDA 13.1
 # ============================================================
 
-# --- PyTorch (CUDA版) ---
-# 注意: 不要用 pip 安装 torch，请用下方 install.bat 中的 conda/pip-wheels 命令
+# --- PyTorch (CUDA版, 由 install.bat 单独安装) ---
 # torch>=2.0.0
 # torchvision>=0.15.0
 
@@ -19,8 +19,12 @@ numpy>=1.24.0
 scipy>=1.10.0
 scikit-image>=0.20.0
 
+# --- 画图 (core/utils.py 内部使用) ---
+matplotlib>=3.5.0
+
 # --- ProPainter 模型依赖 ---
 einops>=0.6.0
+lpips>=0.1.4
 timm>=0.9.0
 pyyaml>=6.0
 
