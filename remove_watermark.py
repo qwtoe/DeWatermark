@@ -674,10 +674,11 @@ def process_chunks(
             cv2.imwrite(out_path, cv2.cvtColor(result_np[local_idx], cv2.COLOR_RGB2BGR))
 
         # ====== 步骤 4: 三重内存清理 ======
+        chunk_len = len(chunk_paths)
         del frames_tensor, mask_tensor, result_tensor, result_np, chunk_paths
         _cleanup_memory(verbose=(chunk_idx % 10 == 0))
 
-        pbar.update(len(chunk_paths))
+        pbar.update(chunk_len)
 
         # 报告显存状态
         if use_cuda and chunk_idx % 5 == 0:
