@@ -826,7 +826,7 @@ def main():
     if use_cuda:
         props = torch.cuda.get_device_properties(0)
         print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"显存: {props.total_mem / 1024**3:.1f} GB")
+        print(f"显存: {props.total_memory / 1024**3:.1f} GB")
         print(f"CUDA: {torch.version.cuda}")
         print(f"精度: {'FP16' if use_fp16 else 'FP32'}")
     else:
@@ -844,7 +844,7 @@ def main():
 
     # ====== 验证显存 ======
     if use_cuda:
-        free_mem = (torch.cuda.get_device_properties(0).total_mem - torch.cuda.memory_allocated()) / 1024**3
+        free_mem = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 1024**3
         print(f"可用显存: ~{free_mem:.1f} GB")
         if free_mem < 2.0 and not args.resize:
             print("\n*** WARNING: 可用显存不足 2GB，强烈建议使用 --resize 480 ***")
