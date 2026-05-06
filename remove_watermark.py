@@ -4,6 +4,10 @@ ProPainter 视频去水印工具
 """
 
 import os
+
+# 必须在 import torch 之前设置，防止显存碎片化导致的 OOM
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import re
 import sys
 import gc
@@ -411,20 +415,31 @@ def propainter_infer_chunk(
 
                 gt_flows_f_list.append(flows_f)
                 gt_flows_b_list.append(flows_b)
+                del flows_f, flows_b
                 torch.cuda.empty_cache()
 
             gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
             gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
+            del gt_flows_f_list, gt_flows_b_list
             gt_flows_bi = (gt_flows_f, gt_flows_b)
         else:
             gt_flows_bi = fix_raft(raft_input, iters=raft_iter)
             torch.cuda.empty_cache()
 
-        # ---- FP16 转换 ----
+        # 释放 RAFT FP32 输入
+        del raft_input
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        # ---- FP16 转换 (RAFT输出转半精度，释放FP32副本) ----
         if use_fp16:
             frames_tensor = frames_tensor.half()
             mask_tensor = mask_tensor.half()
-            gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
+            flows_f_fp16 = gt_flows_bi[0].half()
+            flows_b_fp16 = gt_flows_bi[1].half()
+            del gt_flows_bi
+            gt_flows_bi = (flows_f_fp16, flows_b_fp16)
+            torch.cuda.empty_cache()
 
         # ---- 2. 流补全 ----
         flow_length = gt_flows_bi[0].size(1)
@@ -771,11 +786,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  # 基本用法
+  # 基本用法 (自动根据显存和分辨率降级)
   python remove_watermark.py -i video.mp4 -o output.mp4
 
-  # 如果爆显存，降分辨率到 480p
+  # 手动指定降级分辨率
   python remove_watermark.py -i video.mp4 -o output.mp4 --resize 480
+
+  # 不使用降级 (显存够大时)
+  python remove_watermark.py -i video.mp4 -o output.mp4 --resize none
+
+  # 限制显存预算为4GB (自动更保守)
+  python remove_watermark.py -i video.mp4 -o output.mp4 --vram-budget 4
 
   # 进一步降低每批帧数
   python remove_watermark.py -i video.mp4 -o output.mp4 --resize 480 --chunk-size 3
@@ -804,6 +825,16 @@ def main():
     parser.add_argument("--no-cuda", action="store_true",
                         help="强制使用 CPU (极慢，最后手段)")
 
+    # --- 内存/降级策略 (全部可配置) ---
+    parser.add_argument("--resize", type=str, default="auto",
+                        help="推理分辨率: 数字(如480/720) = 固定降级; 'auto' = 根据显存自动判断; 'none' = 原分辨率 (默认: auto)")
+    parser.add_argument("--chunk-size", type=int, default=5,
+                        help="每批处理帧数 (默认5，显存紧张时降低到3)")
+    parser.add_argument("--raft-iter", type=int, default=20,
+                        help="RAFT 光流迭代次数 (默认20，可降至10加速)")
+    parser.add_argument("--vram-budget", type=float, default=None,
+                        help="显存预算(GB)，用于自动降级判断 (默认: 自动检测GPU总显存)")
+
     # 视频参数
     parser.add_argument("--crf", type=int, default=18,
                         help="输出视频质量 CRF (越小越好，默认18)")
@@ -817,6 +848,18 @@ def main():
                         help="强制重新生成 Mask (忽略已有mask.png)")
 
     args = parser.parse_args()
+
+    # 解析 --resize 参数
+    if args.resize == "none":
+        args.resize = None
+    elif args.resize == "auto":
+        pass  # 后面自动判断
+    else:
+        try:
+            args.resize = int(args.resize)
+        except ValueError:
+            print(f"ERROR: --resize 参数无效: {args.resize}，可选值: auto / none / 数字(如480)")
+            sys.exit(1)
 
     # ====== 环境检测 ======
     print("=" * 60)
@@ -847,15 +890,27 @@ def main():
         print(f"ERROR: 输入视频不存在: {args.input}")
         sys.exit(1)
 
-    # ====== 验证显存 ======
+    # ====== 验证显存，确定显存预算 ======
     if use_cuda:
-        free_mem = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 1024**3
-        print(f"可用显存: ~{free_mem:.1f} GB")
-        if free_mem < 2.0 and not args.resize:
-            print("\n*** WARNING: 可用显存不足 2GB，强烈建议使用 --resize 480 ***")
-        if free_mem < 1.0 and not args.resize:
-            print("\n*** ERROR: 显存严重不足，自动启用 --resize 480 ***")
-            args.resize = 480
+        total_vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        if args.vram_budget is not None:
+            vram_budget = min(args.vram_budget, total_vram)
+            print(f"显存预算(用户指定): {vram_budget:.1f} GB / 总计 {total_vram:.1f} GB")
+        else:
+            vram_budget = total_vram
+            print(f"显存预算(自动): {vram_budget:.1f} GB / 总计 {total_vram:.1f} GB")
+    else:
+        vram_budget = 0
+
+    # 打印当前策略（auto 稍后根据分辨率确定）
+    resize_is_auto = (isinstance(args.resize, str) and args.resize == "auto")
+    if resize_is_auto:
+        print(f"降级分辨率: 自动判断 (根据视频分辨率和{vram_budget:.0f}GB显存预算)")
+    elif args.resize is not None:
+        print(f"降级分辨率: {args.resize}p (手动指定)")
+    else:
+        print(f"降级分辨率: 原始 (--resize none)")
+    print(f"Chunk 大小: {args.chunk_size} 帧/批")
 
     # ====== 准备工作目录 ======
     base_temp = tempfile.mkdtemp(prefix="propainter_")
@@ -876,6 +931,38 @@ def main():
         if total_frames == 0:
             print("ERROR: 视频没有帧")
             sys.exit(1)
+
+        # 基于分辨率和显存预算的智能降级
+        if resize_is_auto and use_cuda:
+            min_dim = min(width, height)
+
+            # 安全分辨率表: 根据显存预算推荐最大安全分辨率
+            if vram_budget <= 4:
+                safe_max = 360
+            elif vram_budget <= 6.5:
+                safe_max = 540
+            elif vram_budget <= 10:
+                safe_max = 720
+            else:
+                safe_max = 1080
+
+            if min_dim > safe_max:
+                # 取安全分辨率中最大的且 ≤ min_dim 的值
+                if min_dim > 720 and safe_max >= 540:
+                    target = 480
+                elif min_dim > 540 and safe_max >= 360:
+                    target = max(360, safe_max)
+                else:
+                    target = safe_max
+
+                print(f"\n*** 视频 {min_dim}p + {vram_budget:.0f}GB显存 → 自动降级至 {target}p 推理 ***")
+                print(f"*** (可手动指定 --resize 720 / --resize none 覆盖此行为) ***")
+                args.resize = target
+            else:
+                print(f"\n*** 视频 {min_dim}p, 在 {vram_budget:.0f}GB 显存安全范围内, 原始分辨率推理 ***")
+                args.resize = None
+        elif resize_is_auto:
+            args.resize = None
 
         # ====== 步骤 2: 生成/加载 Mask ======
         print(f"\n[步骤 2/5] 准备水印 Mask...")
