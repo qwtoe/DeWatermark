@@ -811,14 +811,6 @@ def main():
     parser.add_argument("-o", "--output", default="output_clean.mp4", help="输出视频路径 (默认: output_clean.mp4)")
     parser.add_argument("-m", "--mask", default="mask.png", help="Mask 路径 (默认: mask.png，不存在则交互框选)")
 
-    # 降级策略参数
-    parser.add_argument("--resize", type=int, default=None,
-                        help="降级分辨率 (如 480 或 720)。推理时缩放至此尺寸，完成后还原。爆显存必用。")
-    parser.add_argument("--chunk-size", type=int, default=5,
-                        help="每批处理帧数 (默认5，显存紧张时降低到3)")
-    parser.add_argument("--raft-iter", type=int, default=20,
-                        help="RAFT 光流迭代次数 (默认20，可降至10加速)")
-
     # 精度控制
     parser.add_argument("--fp32", action="store_true",
                         help="使用 FP32 全精度 (默认FP16，更省显存)")
