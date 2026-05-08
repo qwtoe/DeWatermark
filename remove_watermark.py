@@ -5,7 +5,7 @@ Extreme memory optimization for low-VRAM GPUs (tested on 6 GB).
 
 import os
 
-# 必须在 import torch 之前设置，防止显存碎片化导致的 OOM
+# Must be set before import torch to prevent OOM caused by VRAM fragmentation
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import re
@@ -28,7 +28,7 @@ from tqdm import tqdm
 
 
 def get_ffmpeg_path() -> str:
-    """获取 FFmpeg 可执行文件路径，优先系统PATH，其次imageio-ffmpeg内置"""
+    """Get FFmpeg executable path, preferring system PATH, then imageio-ffmpeg built-in"""
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
         return ffmpeg
@@ -40,9 +40,9 @@ def get_ffmpeg_path() -> str:
         pass
 
     raise RuntimeError(
-        "未找到 FFmpeg。请执行以下操作之一:\n"
-        "  1. 安装 FFmpeg 并添加到系统 PATH\n"
-        "  2. pip install imageio-ffmpeg (install.bat 已包含)"
+        "FFmpeg not found. Please do one of the following:\n"
+        "  1. Install FFmpeg and add it to system PATH\n"
+        "  2. pip install imageio-ffmpeg (included in install.bat)"
     )
 
 
@@ -52,20 +52,20 @@ def extract_frames(
     quality: int = 95,
 ) -> Tuple[List[str], float, Tuple[int, int], int]:
     """
-    使用 FFmpeg 将视频逐帧提取为 JPEG 存到磁盘。
-    整个视频绝不加载到 Python 内存中。
+    Extract video frames to disk as JPEG using FFmpeg.
+    Never loads the entire video into Python memory.
 
     Args:
-        video_path: 输入视频路径
-        output_dir: 帧输出目录
-        quality: JPEG 质量 (1-100)
+        video_path: Input video path
+        output_dir: Frame output directory
+        quality: JPEG quality (1-100)
 
     Returns:
         (frame_paths, fps, (width, height), total_frames)
     """
     ffmpeg = get_ffmpeg_path()
 
-    # 先获取视频信息
+    # First get video info
     probe_cmd = [
         ffmpeg, "-i", video_path,
         "-f", "null", "-"
@@ -78,19 +78,19 @@ def extract_frames(
         )
         stderr = result.stderr
     except Exception:
-        raise RuntimeError(f"无法读取视频文件: {video_path}")
+        raise RuntimeError(f"Cannot read video file: {video_path}")
 
-    # 解析分辨率
+    # Parse resolution
     res_match = re.search(r'(\d{2,5})x(\d{2,5})', stderr)
     if not res_match:
-        raise RuntimeError(f"无法解析视频分辨率: {video_path}")
+        raise RuntimeError(f"Cannot parse video resolution: {video_path}")
     width, height = int(res_match.group(1)), int(res_match.group(2))
 
-    # 解析 FPS
+    # Parse FPS
     fps_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:fps|FPS)', stderr)
     fps = float(fps_match.group(1)) if fps_match else 30.0
 
-    # 解析总帧数 (从 nb_frames 或 duration * fps 估算)
+    # Parse total frames (estimated from nb_frames or duration * fps)
     nb_frames_match = re.search(r'Nb_frames:\s*(\d+)', stderr)
     if nb_frames_match:
         total_frames = int(nb_frames_match.group(1))
@@ -103,9 +103,9 @@ def extract_frames(
         else:
             total_frames = 0
 
-    print(f"视频信息: {width}x{height}, {fps:.2f} FPS, ~{total_frames} 帧")
+    print(f"Video info: {width}x{height}, {fps:.2f} FPS, ~{total_frames} frames")
 
-    # FFmpeg 逐帧提取 JPEG
+    # FFmpeg extract frames as JPEG
     output_pattern = os.path.join(output_dir, "frame_%06d.jpg")
     extract_cmd = [
         ffmpeg,
@@ -117,17 +117,17 @@ def extract_frames(
         output_pattern
     ]
 
-    print("正在从视频提取帧到磁盘...")
+    print("Extracting frames from video to disk...")
     subprocess.run(extract_cmd, check=True)
 
-    # 收集所有帧路径
+    # Collect all frame paths
     frame_paths = sorted([
         os.path.join(output_dir, f)
         for f in os.listdir(output_dir)
         if f.endswith('.jpg')
     ])
     actual_count = len(frame_paths)
-    print(f"提取完成: {actual_count} 帧 → {output_dir}")
+    print(f"Extraction complete: {actual_count} frames -> {output_dir}")
 
     return frame_paths, fps, (width, height), actual_count
 
@@ -140,31 +140,31 @@ def generate_mask(
     height: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    弹出窗口让用户在第一帧上框选水印位置，自动生成 Mask 和 Flow Mask。
+    Pop up a window for the user to select the watermark region on the first frame, auto-generating Mask and Flow Mask.
 
     Args:
-        first_frame_path: 第一帧 JPEG 路径
-        mask_path: 保存 mask 的路径
-        flow_mask_path: 保存 flow_mask 的路径
-        width: 视频宽度
-        height: 视频高度
+        first_frame_path: First frame JPEG path
+        mask_path: Path to save the mask
+        flow_mask_path: Path to save the flow_mask
+        width: Video width
+        height: Video height
 
     Returns:
-        (mask, flow_mask): (H, W) 二值图，水印区域=255，其它=0
+        (mask, flow_mask): (H, W) binary image, watermark region=255, others=0
     """
     import scipy.ndimage
 
     frame = cv2.imread(first_frame_path)
     if frame is None:
-        raise RuntimeError(f"无法读取第一帧: {first_frame_path}")
+        raise RuntimeError(f"Cannot read first frame: {first_frame_path}")
 
     print("\n" + "=" * 60)
-    print("请在弹出窗口中框选水印区域")
-    print("操作提示:")
-    print("  - 鼠标拖拽框选水印位置")
-    print("  - 按 SPACE/ENTER 确认当前选框")
-    print("  - 按 ESC 跳过（不处理）")
-    print("  - 可多次框选多个水印区域")
+    print("Please select the watermark region in the popup window")
+    print("Instructions:")
+    print("  - Drag mouse to select watermark region")
+    print("  - Press SPACE/ENTER to confirm selection")
+    print("  - Press ESC to skip (no processing)")
+    print("  - You can select multiple watermark regions")
     print("=" * 60 + "\n")
 
     mask = np.zeros((height, width), dtype=np.uint8)
@@ -177,25 +177,25 @@ def generate_mask(
 
         x, y, w, h = roi
         mask[y:y + h, x:x + w] = 255
-        print(f"  已标记水印区域: x={x}, y={y}, w={w}, h={h}")
+        print(f"  Marked watermark region: x={x}, y={y}, w={w}, h={h}")
 
         cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
     cv2.destroyAllWindows()
 
     if mask.max() == 0:
-        print("\nWARNING: 未选择任何水印区域，将跳过去水印处理")
+        print("\nWARNING: No watermark region selected, skipping watermark removal")
         flow_mask = mask.copy()
     else:
-        # 生成 mask (膨胀5次，用于图像修复)
+        # Generate mask (dilated 5 times, for inpainting)
         mask_dilated = scipy.ndimage.binary_dilation(mask > 128, iterations=5).astype(np.uint8) * 255
         cv2.imwrite(mask_path, mask_dilated)
-        print(f"\nMask 已保存: {mask_path}")
+        print(f"\nMask saved: {mask_path}")
 
-        # 生成 flow_mask (膨胀8次，用于光流补全，更大的区域确保光流稳定)
+        # Generate flow_mask (dilated 8 times, for optical flow completion, larger area ensures flow stability)
         flow_mask = scipy.ndimage.binary_dilation(mask > 128, iterations=8).astype(np.uint8) * 255
         cv2.imwrite(flow_mask_path, flow_mask)
-        print(f"Flow Mask 已保存: {flow_mask_path}")
+        print(f"Flow Mask saved: {flow_mask_path}")
 
         mask = mask_dilated
 
@@ -211,25 +211,25 @@ def load_or_generate_mask(
     force_regenerate: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    加载已有 Mask/Flow Mask 或通过交互框选生成新 Mask。
+    Load existing Mask/Flow Mask or generate new Mask via interactive selection.
 
     Args:
-        first_frame_path: 第一帧路径（生成新mask时需要）
-        mask_path: Mask 保存/加载路径
-        flow_mask_path: Flow Mask 保存/加载路径
-        width: 视频宽度
-        height: 视频高度
-        force_regenerate: 强制重新生成
+        first_frame_path: First frame path (needed to generate new mask)
+        mask_path: Mask save/load path
+        flow_mask_path: Flow Mask save/load path
+        width: Video width
+        height: Video height
+        force_regenerate: Force regeneration
 
     Returns:
-        (mask, flow_mask): (H, W) 二值图
+        (mask, flow_mask): (H, W) binary image
     """
     if os.path.exists(mask_path) and os.path.exists(flow_mask_path) and not force_regenerate:
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         flow_mask = cv2.imread(flow_mask_path, cv2.IMREAD_GRAYSCALE)
         if mask is not None and flow_mask is not None:
-            print(f"已加载现有 Mask: {mask_path}")
-            print(f"已加载现有 Flow Mask: {flow_mask_path}")
+            print(f"Loaded existing Mask: {mask_path}")
+            print(f"Loaded existing Flow Mask: {flow_mask_path}")
             return mask, flow_mask
 
     return generate_mask(first_frame_path, mask_path, flow_mask_path, width, height)
@@ -243,19 +243,19 @@ def get_ref_index(
     ref_num: int = -1,
 ) -> List[int]:
     """
-    选择参考帧索引，为 ProPainter Transformer 提供全局上下文。
+    Select reference frame indices to provide global context for the ProPainter Transformer.
 
-    参考帧是视频中不在当前邻域内的帧，用于帮助模型理解全局场景信息。
+    Reference frames are frames outside the current neighborhood, used to help the model understand global scene information.
 
     Args:
-        mid_neighbor_id: 当前邻域的中心帧索引
-        neighbor_ids: 当前邻域的帧索引列表
-        length: 视频总帧数
-        ref_stride: 参考帧选取步长
-        ref_num: 参考帧数量上限 (-1 表示不限制)
+        mid_neighbor_id: Center frame index of the current neighborhood
+        neighbor_ids: List of frame indices in the current neighborhood
+        length: Total number of video frames
+        ref_stride: Reference frame stride
+        ref_num: Maximum number of reference frames (-1 means unlimited)
 
     Returns:
-        参考帧索引列表
+        List of reference frame indices
     """
     ref_index = []
     neighbor_set = set(neighbor_ids)
@@ -277,7 +277,7 @@ def get_ref_index(
 
 
 # ============================================================
-# ProPainter 模型加载模块
+# ProPainter model loading module
 # ============================================================
 
 PROPAINTER_REPO_URL = "https://github.com/sczhou/ProPainter.git"
@@ -285,49 +285,49 @@ PROPAINTER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ProPa
 PRETRAIN_URL_BASE = "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/"
 
 WEIGHT_FILES = {
-    "raft-things.pth": "RAFT 光流模型",
-    "recurrent_flow_completion.pth": "循环流补全模型",
-    "ProPainter.pth": "ProPainter 修复模型",
+    "raft-things.pth": "RAFT optical flow model",
+    "recurrent_flow_completion.pth": "Recurrent flow completion model",
+    "ProPainter.pth": "ProPainter inpainting model",
 }
 
 
 def ensure_propainter() -> str:
     """
-    确保 ProPainter 源码存在，如不存在则自动 git clone。
-    返回 ProPainter 目录路径。
+    Ensure ProPainter source code exists, if not, auto git clone.
+    Returns the ProPainter directory path.
     """
     if os.path.exists(os.path.join(PROPAINTER_DIR, "inference_propainter.py")):
-        print(f"ProPainter 源码已存在: {PROPAINTER_DIR}")
+        print(f"ProPainter source already exists: {PROPAINTER_DIR}")
         return PROPAINTER_DIR
 
-    # 目录存在但不完整（上次 clone 失败），删除后重试
+    # Directory exists but is incomplete (previous clone failed), delete and retry
     if os.path.exists(PROPAINTER_DIR):
-        print(f"检测到不完整的 ProPainter 目录，正在清理: {PROPAINTER_DIR}")
+        print(f"Detected incomplete ProPainter directory, cleaning up: {PROPAINTER_DIR}")
         shutil.rmtree(PROPAINTER_DIR, ignore_errors=True)
 
-    print(f"首次运行，正在下载 ProPainter 源码...")
-    print(f"源: {PROPAINTER_REPO_URL}")
+    print(f"First run, downloading ProPainter source...")
+    print(f"Source: {PROPAINTER_REPO_URL}")
 
     git_path = shutil.which("git")
     if git_path:
         cmd = [git_path, "clone", "--depth", "1", PROPAINTER_REPO_URL, PROPAINTER_DIR]
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            print("ProPainter 源码下载完成。")
+            print("ProPainter source download complete.")
             return PROPAINTER_DIR
         except subprocess.CalledProcessError as e:
-            print(f"Git clone 失败: {e.stderr}")
+            print(f"Git clone failed: {e.stderr}")
 
     raise RuntimeError(
-        "无法下载 ProPainter 源码。请手动执行:\n"
+        "Cannot download ProPainter source. Please run manually:\n"
         f"  git clone --depth 1 {PROPAINTER_REPO_URL} \"{PROPAINTER_DIR}\""
     )
 
 
 def download_weights(weights_dir: str, force: bool = False) -> dict:
     """
-    下载 ProPainter 预训练权重文件。
-    返回 {name: path} 字典。
+    Download ProPainter pretrained weights.
+    Returns {name: path} dict.
     """
     import requests
 
@@ -337,12 +337,12 @@ def download_weights(weights_dir: str, force: bool = False) -> dict:
     for fname, desc in WEIGHT_FILES.items():
         local_path = os.path.join(weights_dir, fname)
         if os.path.exists(local_path) and not force:
-            print(f"  [已存在] {fname} ({desc})")
+            print(f"  [Exists] {fname} ({desc})")
             weight_paths[fname] = local_path
             continue
 
         url = PRETRAIN_URL_BASE + fname
-        print(f"  下载 {fname} ({desc})...")
+        print(f"  Downloading {fname} ({desc})...")
         print(f"    {url}")
 
         try:
@@ -357,12 +357,12 @@ def download_weights(weights_dir: str, force: bool = False) -> dict:
                         pbar.update(len(chunk))
 
             weight_paths[fname] = local_path
-            print(f"    {fname} 下载完成。")
+            print(f"    {fname} download complete.")
         except Exception as e:
-            print(f"    下载 {fname} 失败: {e}")
+            print(f"    Download {fname} failed: {e}")
             if os.path.exists(local_path):
                 os.remove(local_path)
-            raise RuntimeError(f"权重下载失败: {fname}\n请手动下载到 {weights_dir}/")
+            raise RuntimeError(f"Weight download failed: {fname}\nPlease manually download to {weights_dir}/")
 
     return weight_paths
 
@@ -373,35 +373,35 @@ def load_propainter_models(
     device: str = "cuda",
 ):
     """
-    加载 ProPainter 三个核心模型，支持 FP16 半精度。
+    Load the three core ProPainter models with FP16 half-precision support.
 
     Returns:
         (fix_raft, fix_flow_complete, model):
-            - fix_raft: RAFT_bi 光流模型 (FP32, RAFT用FP32更稳定)
+            - fix_raft: RAFT_bi optical flow model (FP32, RAFT is more stable with FP32)
             - fix_flow_complete: RecurrentFlowCompleteNet
-            - model: InpaintGenerator (ProPainter 修复网络)
+            - model: InpaintGenerator (ProPainter inpainting network)
     """
-    # 确保 ProPainter 源码可用
+    # Ensure ProPainter source is available
     propainter_root = ensure_propainter()
     if propainter_root not in sys.path:
         sys.path.insert(0, propainter_root)
 
-    # 下载权重
+    # Download weights
     weights_dir = os.path.join(PROPAINTER_DIR, "weights") if weights_dir == "weights" else weights_dir
     weight_paths = download_weights(weights_dir)
 
     device_obj = torch.device(device)
-    print(f"\n加载 ProPainter 模型到 {device_obj}...")
+    print(f"\nLoading ProPainter models to {device_obj}...")
 
-    # 1. RAFT 光流模型 (保持 FP32，光流精度敏感)
-    print("  [1/3] 加载 RAFT 光流模型...")
+    # 1. RAFT optical flow model (keep FP32, flow precision is sensitive)
+    print("  [1/3] Loading RAFT optical flow model...")
     from model.modules.flow_comp_raft import RAFT_bi
     fix_raft = RAFT_bi(weight_paths["raft-things.pth"], device_obj)
     fix_raft.eval()
-    print(f"    RAFT 加载完成 (FP32)")
+    print(f"    RAFT loaded (FP32)")
 
-    # 2. 循环流补全网络
-    print("  [2/3] 加载循环流补全网络...")
+    # 2. Recurrent flow completion network
+    print("  [2/3] Loading recurrent flow completion network...")
     from model.recurrent_flow_completion import RecurrentFlowCompleteNet
     fix_flow_complete = RecurrentFlowCompleteNet(weight_paths["recurrent_flow_completion.pth"])
     for p in fix_flow_complete.parameters():
@@ -409,22 +409,22 @@ def load_propainter_models(
     fix_flow_complete.to(device_obj)
     fix_flow_complete.eval()
 
-    # 3. ProPainter 修复网络
-    print("  [3/3] 加载 ProPainter 修复网络...")
+    # 3. ProPainter inpainting network
+    print("  [3/3] Loading ProPainter inpainting network...")
     from model.propainter import InpaintGenerator
     model = InpaintGenerator(model_path=weight_paths["ProPainter.pth"]).to(device_obj)
     model.eval()
 
-    # FP16 转换（RAFT 除外）
+    # FP16 conversion (except RAFT)
     if use_fp16 and device != "cpu":
-        print("  启用 FP16 半精度...")
+        print("  Enabling FP16 half-precision...")
         fix_flow_complete = fix_flow_complete.half()
         model = model.half()
     else:
-        print("  使用 FP32 全精度")
+        print("  Using FP32 full precision")
 
     torch.cuda.empty_cache()
-    print(f"  模型加载完成。")
+    print(f"  Model loading complete.")
 
     return fix_raft, fix_flow_complete, model
 
@@ -437,17 +437,17 @@ def preprocess_frames_for_propainter(
     num_local_frames: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[int, int], Tuple[int, int]]:
     """
-    从 PIL 图像列表预处理为 ProPainter 输入格式。
+    Preprocess from PIL image list to ProPainter input format.
 
-    支持参考帧：前 num_local_frames 帧为本地帧（带水印 mask），
-    其余为参考帧（mask 为零，表示无水印）。
+    Supports reference frames: first num_local_frames are local frames (with watermark mask),
+    the rest are reference frames (mask is zero, meaning no watermark).
 
     Args:
-        frame_pils: PIL Image 列表 (本地帧 + 参考帧)
-        mask: (H, W) 二值 mask (255=水印区域)，用于本地帧
-        flow_mask: (H, W) 二值 flow_mask (255=水印区域，更大膨胀)，用于光流补全
-        resize_to: 可选，缩放到的短边尺寸
-        num_local_frames: 本地帧数量，其余为参考帧。None 表示全部为本地帧
+        frame_pils: List of PIL Images (local frames + reference frames)
+        mask: (H, W) binary mask (255=watermark region) for local frames
+        flow_mask: (H, W) binary flow_mask (255=watermark region, more dilated) for optical flow completion
+        resize_to: Optional, short side size to resize to
+        num_local_frames: Number of local frames, the rest are reference frames. None means all are local frames
 
     Returns:
         (frames_tensor, mask_tensor, flow_mask_tensor, original_size, process_size)
@@ -458,7 +458,7 @@ def preprocess_frames_for_propainter(
     if num_local_frames is None:
         num_local_frames = len(frame_pils)
 
-    # 计算处理尺寸
+    # Compute processing size
     orig_w, orig_h = frame_pils[0].size
     original_size = (orig_w, orig_h)
 
@@ -474,14 +474,14 @@ def preprocess_frames_for_propainter(
         new_h = orig_h - orig_h % 8
         process_size = (new_w, new_h)
 
-    # Resize 帧
+    # Resize frames
     resized_frames = []
     for f in frame_pils:
         if process_size != (orig_w, orig_h):
             f = f.resize(process_size, Image.LANCZOS)
         resized_frames.append(f)
 
-    # Resize mask 和 flow_mask
+    # Resize mask and flow_mask
     mask_img = Image.fromarray(mask)
     flow_mask_img = Image.fromarray(flow_mask)
     if process_size != (orig_w, orig_h):
@@ -490,24 +490,24 @@ def preprocess_frames_for_propainter(
     mask_np = np.array(mask_img)
     flow_mask_np = np.array(flow_mask_img)
 
-    # 处理 mask: 二值化 (mask 已经在 generate_mask 中膨胀过了)
+    # Process mask: binarize (mask already dilated in generate_mask)
     mask_binary = (mask_np > 128).astype(np.uint8) * 255
     flow_mask_binary = (flow_mask_np > 128).astype(np.uint8) * 255
 
-    # 转为 tensor
+    # Convert to tensor
     frames_t = to_tensors_fn()(resized_frames).unsqueeze(0) * 2.0 - 1.0  # (1,T,3,H,W)
 
-    # 创建 mask tensor: 本地帧使用水印 mask，参考帧 mask 为零
+    # Create mask tensor: local frames use watermark mask, reference frames use zero mask
     mask_imgs = []
     for i in range(len(resized_frames)):
         if i < num_local_frames:
             mask_imgs.append(Image.fromarray(mask_binary))
         else:
-            # 参考帧: mask 为全零（无水印区域）
+            # Reference frames: mask is all zeros (no watermark region)
             mask_imgs.append(Image.fromarray(np.zeros_like(mask_binary)))
     mask_t = to_tensors_fn()(mask_imgs).unsqueeze(0)  # (1,T,1,H,W)
 
-    # 创建 flow_mask tensor: 仅用于本地帧的光流补全
+    # Create flow_mask tensor: only used for optical flow completion of local frames
     flow_mask_imgs = [Image.fromarray(flow_mask_binary)] * num_local_frames
     flow_mask_t = to_tensors_fn()(flow_mask_imgs).unsqueeze(0)  # (1,T_local,1,H,W)
 
@@ -527,37 +527,37 @@ def precompute_all_flows(
     chunk_size: int = 5,
 ) -> List[Tuple[int, torch.Tensor, torch.Tensor]]:
     """
-    预计算整个视频的所有光流并保存到 CPU 内存。
-    返回 [(start_idx, pred_flows_f_cpu, pred_flows_b_cpu), ...] 列表，
-    每个元组对应 chunk_size 个 flow pair（最后一组可能不足 chunk_size）。
+    Precompute all optical flows for the entire video and save to CPU memory.
+    Returns [(start_idx, pred_flows_f_cpu, pred_flows_b_cpu), ...] list,
+    each tuple corresponds to chunk_size flow pairs (last chunk may be smaller).
 
-    每个 chunk 处理 (chunk_size + 1) 帧输入以产生 chunk_size 个 flow pair，
-    chunks 之间重叠 1 帧以确保跨块边界的 flow 也可用。
+    Each chunk processes (chunk_size + 1) input frames to produce chunk_size flow pairs,
+    chunks overlap by 1 frame to ensure cross-boundary flows are also available.
 
     Args:
-        frame_paths: 所有帧路径列表
-        mask: (H, W) 二值 mask（仅用于预处理接口兼容，实际只用 flow_mask）
-        flow_mask: (H, W) 二值 flow_mask
-        resize_to: 可选降级分辨率
-        fix_raft: RAFT 光流模型
-        fix_flow_complete: 循环流补全模型
-        raft_iter: RAFT 迭代次数
-        use_fp16: 半精度
-        device: 设备
-        chunk_size: 每批处理的 flow pair 数
+        frame_paths: List of all frame paths
+        mask: (H, W) binary mask (only for preprocessing interface compatibility, actually only uses flow_mask)
+        flow_mask: (H, W) binary flow_mask
+        resize_to: Optional downscale resolution
+        fix_raft: RAFT optical flow model
+        fix_flow_complete: Recurrent flow completion model
+        raft_iter: RAFT iteration count
+        use_fp16: Half precision
+        device: Device
+        chunk_size: Number of flow pairs per batch
     """
     from PIL import Image
 
     total_frames = len(frame_paths)
     device_obj = torch.device(device)
-    dummy_mask = np.zeros_like(flow_mask)  # flow 预计算不需要 mask
+    dummy_mask = np.zeros_like(flow_mask)  # flow precomputation does not need mask
 
-    print(f"\n预计算光流: {total_frames} 帧, 每批 {chunk_size} flow pairs")
+    print(f"\nPrecomputing optical flow: {total_frames} frames, {chunk_size} flow pairs per batch")
     flows_list: List[Tuple[int, torch.Tensor, torch.Tensor]] = []
-    pbar = tqdm(total=max(0, total_frames - 1), desc="光流预计算", unit="flow")
+    pbar = tqdm(total=max(0, total_frames - 1), desc="Flow precomputation", unit="flow")
 
     for start_idx in range(0, total_frames - 1, chunk_size):
-        # 每个 chunk 取 (chunk_size + 1) 帧 → chunk_size 个 flow pair
+        # Each chunk takes (chunk_size + 1) frames -> chunk_size flow pairs
         end_idx = min(start_idx + chunk_size + 1, total_frames)
         actual_num_flows = end_idx - start_idx - 1
         if actual_num_flows <= 0:
@@ -566,10 +566,10 @@ def precompute_all_flows(
         neighbor_ids = list(range(start_idx, end_idx))
         l_t = len(neighbor_ids)
 
-        # 加载帧
+        # Load frames
         local_pils = [Image.open(frame_paths[i]).convert("RGB") for i in neighbor_ids]
 
-        # 预处理（只需要 frames_tensor 和 flow_mask_tensor）
+        # Preprocessing (only needs frames_tensor and flow_mask_tensor)
         frames_tensor, _, flow_mask_tensor, _, _ = \
             preprocess_frames_for_propainter(
                 local_pils, dummy_mask, flow_mask, resize_to, num_local_frames=l_t
@@ -582,7 +582,7 @@ def precompute_all_flows(
 
         local_frames = frames_tensor[:, :l_t, :, :, :]
 
-        # ---- 计算光流 + 补全 ----
+        # ---- Compute optical flow + completion ----
         try:
             with torch.inference_mode():
                 video_length = local_frames.size(1)
@@ -628,7 +628,7 @@ def precompute_all_flows(
                     gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
                     torch.cuda.empty_cache()
 
-                # 流补全
+                # Flow completion
                 subvideo_length = 80
                 flow_length = gt_flows_bi[0].size(1)
 
@@ -668,9 +668,9 @@ def precompute_all_flows(
 
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                print(f"\n  [OOM] 光流预计算显存不足，清理后重试...")
+                print(f"\n  [OOM] Flow precomputation out of VRAM, cleaning up and retrying...")
                 _cleanup_memory(verbose=True)
-                # 单次重试
+                # Single retry
                 with torch.inference_mode():
                     raft_input = local_frames.float()
                     gt_flows_bi = fix_raft(raft_input, iters=raft_iter)
@@ -687,7 +687,7 @@ def precompute_all_flows(
             else:
                 raise
 
-        # 移到 CPU 并截断到实际 flow 数量
+        # Move to CPU and truncate to actual flow count
         pred_flows_f_cpu = pred_flows_f[:, :actual_num_flows].cpu()
         pred_flows_b_cpu = pred_flows_b[:, :actual_num_flows].cpu()
         del pred_flows_f, pred_flows_b
@@ -695,14 +695,14 @@ def precompute_all_flows(
 
         flows_list.append((start_idx, pred_flows_f_cpu, pred_flows_b_cpu))
 
-        # 清理
+        # Cleanup
         del frames_tensor, flow_mask_tensor, local_frames, local_pils
         _cleanup_memory(verbose=(start_idx % (chunk_size * 10) == 0))
 
         pbar.update(actual_num_flows)
 
     pbar.close()
-    print(f"光流预计算完成: {len(flows_list)} 块")
+    print(f"Flow precomputation complete: {len(flows_list)} chunks")
     return flows_list
 
 
@@ -712,13 +712,13 @@ def _get_flows_for_window(
     precomputed_flows: List[Tuple[int, torch.Tensor, torch.Tensor]],
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
-    从预计算的光流列表中提取指定窗口 [window_start, window_end) 所需 flows。
-    返回 (flows_f, flows_b) CPU tensor，若未找到则返回 (None, None)。
+    Extract flows for the specified window [window_start, window_end) from precomputed flow list.
+    Returns (flows_f, flows_b) CPU tensor, or (None, None) if not found.
 
-    window 有 T 帧时需要 T-1 个 flow pair（索引从 window_start 到 window_end-2）。
+    A window with T frames needs T-1 flow pairs (indices from window_start to window_end-2).
     """
     need_start = window_start
-    need_end = window_end - 1  # 最后一个 flow pair 的索引（不含）
+    need_end = window_end - 1  # index of last flow pair (exclusive)
     if need_end <= need_start:
         return None, None
 
@@ -727,9 +727,9 @@ def _get_flows_for_window(
 
     for chunk_start, chunk_flows_f, chunk_flows_b in precomputed_flows:
         num_flows = chunk_flows_f.size(1)
-        chunk_end = chunk_start + num_flows  # 此 chunk 覆盖的 flow 索引区间 [start, end)
+        chunk_end = chunk_start + num_flows  # this chunk covers flow index range [start, end)
 
-        # 检查是否有交集
+        # Check if there is an intersection
         if chunk_end <= need_start or chunk_start >= need_end:
             continue
 
@@ -748,7 +748,7 @@ def _get_flows_for_window(
 
 
 def _cleanup_memory(verbose: bool = False):
-    """三重内存清理：del引用 + gc.collect() + CUDA缓存清空"""
+    """Triple memory cleanup: del references + gc.collect() + CUDA cache clear"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -757,7 +757,7 @@ def _cleanup_memory(verbose: bool = False):
         if torch.cuda.is_available():
             alloc = torch.cuda.memory_allocated() / 1024**3
             reserved = torch.cuda.memory_reserved() / 1024**3
-            print(f"  [内存清理] 已分配: {alloc:.2f}GB, 已保留: {reserved:.2f}GB")
+            print(f"  [Memory cleanup] Allocated: {alloc:.2f}GB, Reserved: {reserved:.2f}GB")
 
 
 def process_chunks(
@@ -776,28 +776,28 @@ def process_chunks(
     max_ref_frames: int = 0,
 ) -> None:
     """
-    滑动窗口推理 — 核心处理函数。
+    Sliding window inference — core processing function.
 
-    使用预计算光流 + 滑动窗口 + 参考帧策略：
-    1. 光流已由 precompute_all_flows() 预计算并保存在 CPU 内存中
-    2. 每个窗口包含 neighbor_length 帧本地帧 + 若干参考帧
-    3. 模型输出仅在 mask 区域使用修复结果，非 mask 区域保留原始像素
-    4. 重叠帧通过即时读取+回写磁盘实现平均（无需巨型 frame_accum 数组）
+    Uses precomputed optical flow + sliding window + reference frame strategy:
+    1. Flows are precomputed by precompute_all_flows() and stored in CPU memory
+    2. Each window contains neighbor_length local frames + several reference frames
+    3. Model output only uses inpainting results in the mask region, non-mask regions retain original pixels
+    4. Overlap frames are averaged by immediate read+write to disk (no giant frame_accum array)
 
     Args:
-        frame_paths: 所有帧路径列表
-        mask: (H, W) 二值 mask (255=水印区域，已膨胀5次)
-        flow_mask: (H, W) 二值 flow_mask (255=水印区域，已膨胀8次)
-        output_dir: 输出帧目录
-        model: ProPainter 修复模型
-        precomputed_flows: precompute_all_flows() 返回的预计算光流列表
-        chunk_size: 每批处理帧数 (默认5，显存紧张可降到3)
-        resize_to: 降级分辨率 (如 480)
-        use_fp16: 半精度
-        device: 设备
-        neighbor_length: 滑动窗口大小 (默认=chunk_size*2)
-        ref_stride: 参考帧选取步长
-        max_ref_frames: 最大参考帧数 (0=禁用参考帧)
+        frame_paths: List of all frame paths
+        mask: (H, W) binary mask (255=watermark region, dilated 5 times)
+        flow_mask: (H, W) binary flow_mask (255=watermark region, dilated 8 times)
+        output_dir: Output frame directory
+        model: ProPainter inpainting model
+        precomputed_flows: Precomputed flow list from precompute_all_flows()
+        chunk_size: Frames per batch (default 5, reduce to 3 when VRAM is tight)
+        resize_to: Downscale resolution (e.g. 480)
+        use_fp16: Half precision
+        device: Device
+        neighbor_length: Sliding window size (default=chunk_size*2)
+        ref_stride: Reference frame stride
+        max_ref_frames: Maximum reference frames (0=disable ref frames)
     """
     from PIL import Image
 
@@ -810,24 +810,24 @@ def process_chunks(
         neighbor_length = min(chunk_size * 2, total_frames)
     neighbor_stride = max(1, neighbor_length // 2)
 
-    # 参考帧数量: max_ref_frames=0 表示禁用参考帧
+    # Reference frame count: max_ref_frames=0 means disable reference frames
     use_ref_frames = max_ref_frames > 0
 
     print(f"\n{'=' * 60}")
-    print(f"滑动窗口推理: 共 {total_frames} 帧")
-    print(f"  窗口大小: {neighbor_length}, 步长: {neighbor_stride}")
+    print(f"Sliding window inference: {total_frames} total frames")
+    print(f"  Window size: {neighbor_length}, Stride: {neighbor_stride}")
     if use_ref_frames:
-        print(f"  参考帧: 最多 {max_ref_frames} 帧, 步长 {ref_stride}")
+        print(f"  Reference frames: max {max_ref_frames}, stride {ref_stride}")
     else:
-        print(f"  参考帧: 禁用 (节省显存)")
+        print(f"  Reference frames: disabled (saves VRAM)")
     if resize_to:
-        print(f"  降级分辨率: {resize_to}p (推理后还原)")
+        print(f"  Downscale resolution: {resize_to}p (restored after inference)")
     print(f"  FP16: {use_fp16}, GPU: {use_cuda}")
     print(f"{'=' * 60}")
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # 预加载参考帧 (PIL Image) — 仅在启用参考帧时
+    # Preload reference frames (PIL Image) — only when reference frames are enabled
     ref_frames_pil = {}
     if use_ref_frames:
         ref_indices = get_ref_index(0, [], total_frames, ref_stride=ref_stride)
@@ -839,34 +839,34 @@ def process_chunks(
             try:
                 ref_frames_pil[idx] = Image.open(frame_paths[idx]).convert("RGB")
             except Exception as e:
-                print(f"  WARNING: 无法加载参考帧 {idx}: {e}")
+                print(f"  WARNING: Cannot load reference frame {idx}: {e}")
 
-    # 准备 mask（原始分辨率，3通道，用于混合）
+    # Prepare mask (original resolution, 3 channels, for blending)
     mask_3ch = np.stack([mask] * 3, axis=-1).astype(accum_dtype) / 255.0  # (H, W, 3)
 
-    # frame_count 字典跟踪每个帧被写入的次数（用于重叠平均）
+    # frame_count dict tracks how many times each frame was written (for overlap averaging)
     frame_count: Dict[int, int] = {}
 
-    pbar = tqdm(total=total_frames, desc="推理进度", unit="帧")
+    pbar = tqdm(total=total_frames, desc="Inference progress", unit="frame")
 
     for window_start in range(0, total_frames, neighbor_stride):
         window_end = min(window_start + neighbor_length, total_frames)
         neighbor_ids = list(range(window_start, window_end))
 
-        # 选择参考帧
+        # Select reference frames
         ref_ids = []
         if use_ref_frames:
             mid_id = (window_start + window_end) // 2
             ref_ids = get_ref_index(mid_id, neighbor_ids, total_frames, ref_stride=ref_stride)
             ref_ids = [i for i in ref_ids if i in ref_frames_pil]
 
-        # 本地帧 + 参考帧
+        # Local frames + reference frames
         local_pils = [Image.open(frame_paths[i]).convert("RGB") for i in neighbor_ids]
         ref_pils = [ref_frames_pil[i] for i in ref_ids] if use_ref_frames else []
         all_pils = local_pils + ref_pils
         l_t = len(local_pils)
 
-        # ====== 步骤 1: 预处理 ======
+        # ====== Step 1: Preprocessing ======
         frames_tensor, mask_tensor, _, original_size, process_size = \
             preprocess_frames_for_propainter(
                 all_pils, mask, flow_mask, resize_to, num_local_frames=l_t
@@ -882,18 +882,18 @@ def process_chunks(
         local_frames_tensor = frames_tensor[:, :l_t, :, :, :]
         local_mask = mask_tensor[:, :l_t, :, :]
 
-        # ====== 步骤 2: 使用预计算光流 ======
+        # ====== Step 2: Use precomputed optical flow ======
         pred_flows_f_cpu, pred_flows_b_cpu = _get_flows_for_window(
             window_start, window_end, precomputed_flows
         )
         if pred_flows_f_cpu is None:
-            print(f"\n  WARNING: 窗口 [{window_start}, {window_end}) 无预计算光流，跳过")
+            print(f"\n  WARNING: Window [{window_start}, {window_end}) has no precomputed flow, skipping")
             for i, idx in enumerate(neighbor_ids):
                 _write_or_average_frame(frame_paths, output_dir, idx, None, mask_3ch, frame_count)
             pbar.update(len(neighbor_ids))
             continue
 
-        # ====== 步骤 3: 图像传播 + Transformer 推理 ======
+        # ====== Step 3: Image propagation + Transformer inference ======
         try:
             pred_flows_f = pred_flows_f_cpu.to(device_obj)
             pred_flows_b = pred_flows_b_cpu.to(device_obj)
@@ -912,7 +912,7 @@ def process_chunks(
                 updated_frames = local_frames_tensor * (1 - local_mask) + \
                                  updated_frames.view(local_frames_tensor.shape) * local_mask
 
-            # ====== 步骤 4: Transformer 推理 ======
+            # ====== Step 4: Transformer inference ======
             if use_ref_frames and len(ref_ids) > 0:
                 ref_masks = mask_tensor[:, l_t:, :, :]
                 all_updated_masks = torch.cat([updated_masks, ref_masks], dim=1)
@@ -929,7 +929,7 @@ def process_chunks(
                 )
                 torch.cuda.empty_cache()
 
-            # ====== 步骤 5: 后处理 ======
+            # ====== Step 5: Post-processing ======
             result_np = comp_frames.squeeze(0).float().cpu().numpy()
             result_np = (result_np + 1.0) / 2.0
             result_np = np.clip(result_np * 255, 0, 255).astype(np.uint8)
@@ -942,11 +942,11 @@ def process_chunks(
                     resized_results.append(img)
                 result_np = np.stack(resized_results)
 
-            # 混合并写入磁盘
+            # Blend and write to disk
             for i, idx in enumerate(neighbor_ids):
                 orig_frame = cv2.imread(frame_paths[idx])
                 if orig_frame is None:
-                    print(f"  WARNING: 无法读取帧 {idx}")
+                    print(f"  WARNING: Cannot read frame {idx}")
                     continue
                 orig_frame = cv2.cvtColor(orig_frame, cv2.COLOR_BGR2RGB)
 
@@ -956,18 +956,18 @@ def process_chunks(
 
                 _write_or_average_frame(frame_paths, output_dir, idx, blended, mask_3ch, frame_count)
 
-            # 清理
+            # Cleanup
             del pred_flows_f, pred_flows_b
             del comp_frames, result_np
             del updated_frames, updated_masks, all_updated_masks, masked_frames
 
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                print(f"\n  [OOM] 推理显存不足，清理后重试...")
+                print(f"\n  [OOM] Inference out of VRAM, cleaning up and retrying...")
                 _cleanup_memory(verbose=True)
 
                 try:
-                    # 重试：重新获取光流 + 重新推理
+                    # Retry: re-fetch flows + re-run inference
                     pred_flows_f = pred_flows_f_cpu.to(device_obj)
                     pred_flows_b = pred_flows_b_cpu.to(device_obj)
                     if use_fp16:
@@ -1026,7 +1026,7 @@ def process_chunks(
 
                 except RuntimeError as e2:
                     if "out of memory" in str(e2).lower():
-                        print(f"\n  [OOM] 重试仍失败，对窗口 [{window_start}, {window_end}) 使用原始帧 fallback")
+                        print(f"\n  [OOM] Retry still failed, using original frame fallback for window [{window_start}, {window_end})")
                         _cleanup_memory(verbose=True)
                         for i, idx in enumerate(neighbor_ids):
                             _write_or_average_frame(frame_paths, output_dir, idx, None, mask_3ch, frame_count)
@@ -1035,7 +1035,7 @@ def process_chunks(
             else:
                 raise
 
-        # ====== 内存清理（窗口结束） ======
+        # ====== Memory cleanup (end of window) ======
         del frames_tensor, mask_tensor
         del local_frames_tensor, local_mask
         del local_pils, ref_pils, all_pils
@@ -1045,7 +1045,7 @@ def process_chunks(
 
     pbar.close()
 
-    # 确保所有帧都已写入（未处理的帧用原始帧补全）
+    # Ensure all frames are written (unprocessed frames use originals)
     for idx in range(total_frames):
         if idx not in frame_count:
             orig = cv2.imread(frame_paths[idx])
@@ -1053,7 +1053,7 @@ def process_chunks(
                 out_path = os.path.join(output_dir, f"frame_{idx:06d}.jpg")
                 cv2.imwrite(out_path, orig)
 
-    print(f"\n推理完成! 输出帧: {output_dir}")
+    print(f"\nInference complete! Output frames: {output_dir}")
     _cleanup_memory(verbose=True)
 
 
@@ -1066,13 +1066,13 @@ def _write_or_average_frame(
     frame_count: Dict[int, int],
 ) -> None:
     """
-    将 blended 帧写入磁盘。如果是重叠帧（已存在），则读取已有帧并做平均后回写。
-    若 blended 为 None（OOM fallback），则直接使用原始帧。
+    Write blended frame to disk. If it is an overlap frame (already exists), read the existing frame and average before writing back.
+    If blended is None (OOM fallback), use the original frame directly.
     """
     out_path = os.path.join(output_dir, f"frame_{idx:06d}.jpg")
 
     if blended is None:
-        # OOM fallback: 使用原始帧
+        # OOM fallback: use original frame
         orig = cv2.imread(frame_paths[idx])
         if orig is None:
             return
@@ -1081,11 +1081,11 @@ def _write_or_average_frame(
         return
 
     if idx not in frame_count:
-        # 首次写入
+        # First write
         cv2.imwrite(out_path, cv2.cvtColor(blended, cv2.COLOR_RGB2BGR))
         frame_count[idx] = 1
     else:
-        # 重叠帧：读取已有帧，加权平均后回写
+        # Overlap frame: read existing, weighted average, write back
         existing = cv2.imread(out_path)
         if existing is None:
             cv2.imwrite(out_path, cv2.cvtColor(blended, cv2.COLOR_RGB2BGR))
@@ -1106,19 +1106,19 @@ def reconstruct_video(
     input_video_path: Optional[str] = None,
 ) -> None:
     """
-    使用 FFmpeg 将帧序列合并为视频，并可选地从原始视频复制音轨。
+    Use FFmpeg to merge frame sequence into video, optionally copy audio track from original video.
 
     Args:
-        frame_dir: 帧目录
-        output_path: 输出视频路径
-        fps: 帧率
-        crf: 视频质量 (越小越好，推荐 18-23)
-        input_video_path: 原始视频路径（用于复制音轨）
+        frame_dir: Frame directory
+        output_path: Output video path
+        fps: Frame rate
+        crf: Video quality (lower is better, recommended 18-23)
+        input_video_path: Original video path (for copying audio track)
     """
     ffmpeg = get_ffmpeg_path()
     input_pattern = os.path.join(frame_dir, "frame_%06d.jpg")
 
-    # 先生成无声视频
+    # First generate video without audio
     temp_output = output_path + ".tmp.mp4"
     cmd = [
         ffmpeg,
@@ -1133,21 +1133,21 @@ def reconstruct_video(
         temp_output
     ]
 
-    print(f"正在合并帧为视频 → {output_path}")
+    print(f"Merging frames into video -> {output_path}")
     subprocess.run(cmd, check=True)
 
-    # 如果有原始视频，尝试复制音轨
+    # If original video exists, try to copy audio track
     if input_video_path and os.path.exists(input_video_path):
-        # 检查原始视频是否有音轨
+        # Check if original video has audio track
         probe_cmd = [ffmpeg, "-i", input_video_path, "-f", "null", "-"]
         try:
             probe_result = subprocess.run(
                 probe_cmd, capture_output=True, text=True,
                 encoding="utf-8", errors="replace"
             )
-            # 检查是否有音频流
+            # Check if there is an audio stream
             if "Audio:" in probe_result.stderr:
-                print("检测到原始视频音轨，正在合并...")
+                print("Original video audio track detected, merging...")
                 merge_cmd = [
                     ffmpeg,
                     "-i", temp_output,
@@ -1163,29 +1163,29 @@ def reconstruct_video(
                 ]
                 subprocess.run(merge_cmd, check=True)
                 os.remove(temp_output)
-                print("音轨合并完成。")
+                print("Audio track merge complete.")
             else:
-                # 没有音轨，直接重命名
+                # No audio track, just rename
                 os.rename(temp_output, output_path)
-                print("原始视频无音轨，仅生成视频流。")
+                print("Original video has no audio track, video stream only.")
         except subprocess.CalledProcessError:
-            # 合并失败，使用无声视频
+            # Merge failed, use video without audio
             os.rename(temp_output, output_path)
-            print("音轨合并失败，仅生成视频流。")
+            print("Audio track merge failed, video stream only.")
     else:
         os.rename(temp_output, output_path)
-        print("视频生成完成（无音轨）。")
+        print("Video generation complete (no audio track).")
 
 
 def cleanup_temp(*dirs: str) -> None:
-    """安全删除临时目录"""
+    """Safely delete temp directories"""
     for d in dirs:
         if d and os.path.exists(d):
             try:
                 shutil.rmtree(d)
-                print(f"  已清理: {d}")
+                print(f"  Cleaned: {d}")
             except Exception as e:
-                print(f"  清理失败 {d}: {e}")
+                print(f"  Cleanup failed {d}: {e}")
 
 
 def main():
@@ -1193,82 +1193,82 @@ def main():
         description="DeWatermark — Video Watermark Removal with ProPainter (VRAM ≥ 4 GB)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-使用示例:
-  # 基本用法 (自动根据显存和分辨率降级)
+Usage examples:
+  # Basic usage (auto downscale based on VRAM and resolution)
   python remove_watermark.py -i video.mp4 -o output.mp4
 
-  # 手动指定降级分辨率
+  # Manually specify downscale resolution
   python remove_watermark.py -i video.mp4 -o output.mp4 --resize 480
 
-  # 不使用降级 (显存够大时)
+  # No downscale (when VRAM is sufficient)
   python remove_watermark.py -i video.mp4 -o output.mp4 --resize none
 
-  # 限制显存预算为4GB (自动更保守)
+  # Limit VRAM budget to 4GB (auto more conservative)
   python remove_watermark.py -i video.mp4 -o output.mp4 --vram-budget 4
 
-  # 进一步降低每批帧数
+  # Further reduce frames per batch
   python remove_watermark.py -i video.mp4 -o output.mp4 --resize 480 --chunk-size 3
 
-  # 使用已有mask（跳过框选）
+  # Use existing mask (skip selection)
   python remove_watermark.py -i video.mp4 -o output.mp4 --mask mask.png
         """
     )
 
-    # 核心参数
-    parser.add_argument("-i", "--input", required=True, help="输入视频路径")
-    parser.add_argument("-o", "--output", default="output_clean.mp4", help="输出视频路径 (默认: output_clean.mp4)")
-    parser.add_argument("-m", "--mask", default="mask.png", help="Mask 路径 (默认: mask.png，不存在则交互框选)")
-    parser.add_argument("--flow-mask", default="flow_mask.png", help="Flow Mask 路径 (默认: flow_mask.png)")
+    # Core parameters
+    parser.add_argument("-i", "--input", required=True, help="Input video path")
+    parser.add_argument("-o", "--output", default="output_clean.mp4", help="Output video path (default: output_clean.mp4)")
+    parser.add_argument("-m", "--mask", default="mask.png", help="Mask path (default: mask.png, interactive selection if not exists)")
+    parser.add_argument("--flow-mask", default="flow_mask.png", help="Flow Mask path (default: flow_mask.png)")
 
-    # 精度控制
+    # Precision control
     parser.add_argument("--fp32", action="store_true",
-                        help="使用 FP32 全精度 (默认FP16，更省显存)")
+                        help="Use FP32 full precision (default FP16, saves VRAM)")
     parser.add_argument("--no-cuda", action="store_true",
-                        help="强制使用 CPU (极慢，最后手段)")
+                        help="Force CPU usage (very slow, last resort)")
 
-    # --- 内存/降级策略 (全部可配置) ---
+    # --- Memory/downscale strategy (all configurable) ---
     parser.add_argument("--resize", type=str, default="auto",
-                        help="推理分辨率: 数字(如480/720) = 固定降级; 'auto' = 根据显存自动判断; 'none' = 原分辨率 (默认: auto)")
+                        help="Inference resolution: number (e.g. 480/720) = fixed downscale; 'auto' = auto based on VRAM; 'none' = original resolution (default: auto)")
     parser.add_argument("--chunk-size", type=int, default=5,
-                        help="每批处理帧数 (默认5，显存紧张时降低到3)")
+                        help="Frames per batch (default 5, reduce to 3 when VRAM is tight)")
     parser.add_argument("--raft-iter", type=int, default=20,
-                        help="RAFT 光流迭代次数 (默认20，可降至10加速)")
+                        help="RAFT optical flow iterations (default 20, can reduce to 10 for speed)")
     parser.add_argument("--vram-budget", type=float, default=None,
-                        help="显存预算(GB)，用于自动降级判断 (默认: 自动检测GPU总显存)")
+                        help="VRAM budget (GB) for auto downscale decision (default: auto-detect total GPU VRAM)")
     parser.add_argument("--neighbor-length", type=int, default=None,
-                        help="滑动窗口大小 (默认=chunk_size*2，影响时序一致性)")
+                        help="Sliding window size (default=chunk_size*2, affects temporal consistency)")
     parser.add_argument("--ref-stride", type=int, default=10,
-                        help="参考帧选取步长 (默认10，越小参考帧越多)")
+                        help="Reference frame stride (default 10, smaller = more reference frames)")
     parser.add_argument("--max-ref-frames", type=int, default=None,
-                        help="最大参考帧数 (默认: 根据显存自动判断)")
+                        help="Maximum reference frames (default: auto based on VRAM)")
 
-    # 视频参数
+    # Video parameters
     parser.add_argument("--crf", type=int, default=18,
-                        help="输出视频质量 CRF (越小越好，默认18)")
+                        help="Output video quality CRF (lower is better, default 18)")
     parser.add_argument("--quality", type=int, default=95,
-                        help="JPEG 帧质量 1-100 (默认95)")
+                        help="JPEG frame quality 1-100 (default 95)")
 
-    # 其他
+    # Other
     parser.add_argument("--keep-temp", action="store_true",
-                        help="保留临时文件 (调试用)")
+                        help="Keep temp files (debugging)")
     parser.add_argument("--force-mask", action="store_true",
-                        help="强制重新生成 Mask (忽略已有mask.png)")
+                        help="Force regenerate Mask (ignore existing mask.png)")
 
     args = parser.parse_args()
 
-    # 解析 --resize 参数
+    # Parse --resize parameter
     if args.resize == "none":
         args.resize = None
     elif args.resize == "auto":
-        pass  # 后面自动判断
+        pass  # will auto-determine later
     else:
         try:
             args.resize = int(args.resize)
         except ValueError:
-            print(f"ERROR: --resize 参数无效: {args.resize}，可选值: auto / none / 数字(如480)")
+            print(f"ERROR: --resize invalid: {args.resize}, valid values: auto / none / number (e.g. 480)")
             sys.exit(1)
 
-    # ====== 环境检测 ======
+    # ====== Environment detection ======
     print("=" * 60)
     print("DeWatermark v2.2 — ProPainter Video Watermark Removal")
     print("=" * 60)
@@ -1281,82 +1281,82 @@ def main():
     if use_cuda:
         props = torch.cuda.get_device_properties(0)
         print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"显存: {props.total_memory / 1024**3:.1f} GB")
+        print(f"VRAM: {props.total_memory / 1024**3:.1f} GB")
         print(f"CUDA: {torch.version.cuda}")
-        print(f"精度: {'FP16' if use_fp16 else 'FP32'}")
+        print(f"Precision: {'FP16' if use_fp16 else 'FP32'}")
     else:
-        print("模式: CPU (极慢)")
-        print(f"精度: FP32")
+        print("Mode: CPU (very slow)")
+        print(f"Precision: FP32")
 
-    # ====== 检查输入 ======
+    # ====== Check input ======
     if not os.path.exists(args.input):
-        print(f"ERROR: 输入视频不存在: {args.input}")
+        print(f"ERROR: Input video does not exist: {args.input}")
         sys.exit(1)
 
-    # ====== 验证显存，确定显存预算 ======
+    # ====== Validate VRAM, determine VRAM budget ======
     if use_cuda:
         total_vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
         if args.vram_budget is not None:
             vram_budget = min(args.vram_budget, total_vram)
-            print(f"显存预算(用户指定): {vram_budget:.1f} GB / 总计 {total_vram:.1f} GB")
+            print(f"VRAM budget (user-specified): {vram_budget:.1f} GB / Total {total_vram:.1f} GB")
         else:
             vram_budget = total_vram
-            print(f"显存预算(自动): {vram_budget:.1f} GB / 总计 {total_vram:.1f} GB")
+            print(f"VRAM budget (auto): {vram_budget:.1f} GB / Total {total_vram:.1f} GB")
     else:
         vram_budget = 0
 
-    # ====== 根据显存自动调整参数 ======
-    # 显存预算决定推理策略
+    # ====== Auto-tune parameters based on VRAM ======
+    # VRAM budget determines inference strategy
     if args.neighbor_length is None:
         if vram_budget <= 6:
-            args.neighbor_length = args.chunk_size  # 低显存: 无重叠，省显存
+            args.neighbor_length = args.chunk_size  # Low VRAM: no overlap, saves VRAM
         else:
-            args.neighbor_length = min(args.chunk_size * 2, 10)  # 高显存: 有重叠
+            args.neighbor_length = min(args.chunk_size * 2, 10)  # High VRAM: has overlap
 
     if args.max_ref_frames is None:
         if vram_budget <= 6:
-            args.max_ref_frames = 0  # 低显存: 禁用参考帧
+            args.max_ref_frames = 0  # Low VRAM: disable reference frames
         elif vram_budget <= 8:
-            args.max_ref_frames = 2  # 中等显存: 少量参考帧
+            args.max_ref_frames = 2  # Medium VRAM: few reference frames
         else:
-            args.max_ref_frames = 4  # 高显存: 更多参考帧
+            args.max_ref_frames = 4  # High VRAM: more reference frames
 
-    # 打印当前策略
+    # Print current strategy
     resize_is_auto = (isinstance(args.resize, str) and args.resize == "auto")
     if resize_is_auto:
-        print(f"降级分辨率: 自动判断 (根据视频分辨率和{vram_budget:.0f}GB显存预算)")
+        print(f"Downscale: auto (based on video resolution and {vram_budget:.0f}GB VRAM budget)")
     elif args.resize is not None:
-        print(f"降级分辨率: {args.resize}p (手动指定)")
+        print(f"Downscale: {args.resize}p (manual)")
     else:
-        print(f"降级分辨率: 原始 (--resize none)")
-    print(f"Chunk 大小: {args.chunk_size} 帧/批")
-    print(f"窗口大小: {args.neighbor_length}, 参考帧: {args.max_ref_frames}")
+        print(f"Downscale: original (--resize none)")
+    print(f"Chunk size: {args.chunk_size} frames/batch")
+    print(f"Window size: {args.neighbor_length}, Reference frames: {args.max_ref_frames}")
 
-    # ====== 准备工作目录 ======
+    # ====== Prepare working directory ======
     base_temp = tempfile.mkdtemp(prefix="propainter_")
     frames_input_dir = os.path.join(base_temp, "frames_input")
     frames_output_dir = os.path.join(base_temp, "frames_output")
     os.makedirs(frames_input_dir, exist_ok=True)
     os.makedirs(frames_output_dir, exist_ok=True)
 
-    print(f"\n临时目录: {base_temp}")
+    print(f"\nTemp directory: {base_temp}")
 
     try:
-        # ====== 步骤 1: 抽帧 ======
-        print(f"\n[步骤 1/5] 提取视频帧...")
+        # ====== Step 1: Extract frames ======
+        print(f"\n[Step 1/5] Extracting video frames...")
         frame_paths, fps, (width, height), total_frames = extract_frames(
             args.input, frames_input_dir, quality=args.quality
         )
 
         if total_frames == 0:
-            print("ERROR: 视频没有帧")
+            print("ERROR: Video has no frames")
             sys.exit(1)
 
-        # 基于分辨率和显存预算的智能降级
+        # Smart downscale based on resolution and VRAM budget
         if resize_is_auto and use_cuda:
             min_dim = min(width, height)
 
-            # 安全分辨率表: 根据显存预算推荐最大安全分辨率
+            # Safe resolution table: recommended max safe resolution based on VRAM budget
             if vram_budget <= 4:
                 safe_max = 360
             elif vram_budget <= 6.5:
@@ -1374,39 +1374,39 @@ def main():
                 else:
                     target = safe_max
 
-                print(f"\n*** 视频 {min_dim}p + {vram_budget:.0f}GB显存 → 自动降级至 {target}p 推理 ***")
-                print(f"*** (可手动指定 --resize 720 / --resize none 覆盖此行为) ***")
+                print(f"\n*** Video {min_dim}p + {vram_budget:.0f}GB VRAM -> auto downscale to {target}p for inference ***")
+                print(f"*** (use --resize 720 / --resize none to override) ***")
                 args.resize = target
             else:
-                print(f"\n*** 视频 {min_dim}p, 在 {vram_budget:.0f}GB 显存安全范围内, 原始分辨率推理 ***")
+                print(f"\n*** Video {min_dim}p within {vram_budget:.0f}GB VRAM safe range, using original resolution ***")
                 args.resize = None
         elif resize_is_auto:
             args.resize = None
 
-        # ====== 步骤 2: 生成/加载 Mask 和 Flow Mask ======
-        print(f"\n[步骤 2/5] 准备水印 Mask 和 Flow Mask...")
+        # ====== Step 2: Generate/load Mask and Flow Mask ======
+        print(f"\n[Step 2/5] Preparing watermark Mask and Flow Mask...")
         mask, flow_mask = load_or_generate_mask(
             frame_paths[0], args.mask, args.flow_mask, width, height,
             force_regenerate=args.force_mask
         )
 
         if mask.max() == 0:
-            print("WARNING: Mask 为空，水印区域未标记。将直接复制原始帧...")
-            # 直接复制帧到输出目录
+            print("WARNING: Mask is empty, no watermark region marked. Copying original frames directly...")
+            # Copy frames directly to output directory
             import shutil as _shutil
             for i, src in enumerate(frame_paths):
                 dst = os.path.join(frames_output_dir, f"frame_{i:06d}.jpg")
                 _shutil.copy2(src, dst)
         else:
-            # ====== 步骤 3: 加载模型 ======
-            print(f"\n[步骤 3/5] 加载 ProPainter 模型...")
+            # ====== Step 3: Load models ======
+            print(f"\n[Step 3/5] Loading ProPainter models...")
             fix_raft, fix_flow_complete, model = load_propainter_models(
                 use_fp16=use_fp16,
                 device=device_str,
             )
 
-            # ====== 步骤 3b: 预计算光流 ======
-            print(f"\n[步骤 3b/5] 预计算全视频光流...")
+            # ====== Step 3b: Precompute optical flow ======
+            print(f"\n[Step 3b/5] Precomputing full video optical flow...")
             flows_list = precompute_all_flows(
                 frame_paths=frame_paths,
                 mask=mask,
@@ -1420,13 +1420,13 @@ def main():
                 chunk_size=args.chunk_size,
             )
 
-            # 释放 RAFT 模型（不再需要）
-            print("  释放 RAFT 模型...")
+            # Release RAFT model (no longer needed)
+            print("  Releasing RAFT model...")
             del fix_raft
             _cleanup_memory(verbose=True)
 
-            # ====== 步骤 4: 滑动窗口推理 ======
-            print(f"\n[步骤 4/5] 开始去水印推理（使用预计算光流）...")
+            # ====== Step 4: Sliding window inference ======
+            print(f"\n[Step 4/5] Starting watermark removal inference (using precomputed optical flow)...")
             process_chunks(
                 frame_paths=frame_paths,
                 mask=mask,
@@ -1443,35 +1443,35 @@ def main():
                 max_ref_frames=args.max_ref_frames,
             )
 
-            # 释放模型
+            # Release models
             del fix_flow_complete, model
             _cleanup_memory(verbose=True)
-            print("模型已释放")
+            print("Models released")
 
-        # ====== 步骤 5: 合并视频 ======
-        print(f"\n[步骤 5/5] 合并帧为输出视频...")
+        # ====== Step 5: Reconstruct video ======
+        print(f"\n[Step 5/5] Merging frames into output video...")
         reconstruct_video(
             frames_output_dir, args.output, fps, crf=args.crf,
             input_video_path=args.input,
         )
 
         print(f"\n{'=' * 60}")
-        print(f"✓ 完成! 输出视频: {args.output}")
+        print(f"✓ Done! Output video: {args.output}")
         print(f"{'=' * 60}")
 
     except KeyboardInterrupt:
-        print("\n\n用户中断。正在清理...")
+        print("\n\nUser interrupted. Cleaning up...")
     except Exception as e:
         print(f"\nERROR: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        # ====== 清理临时文件 ======
+        # ====== Cleanup temp files ======
         if not args.keep_temp:
-            print("\n清理临时文件...")
+            print("\nCleaning up temp files...")
             cleanup_temp(base_temp)
         else:
-            print(f"\n临时文件保留在: {base_temp}")
+            print(f"\nTemp files kept at: {base_temp}")
 
 
 if __name__ == "__main__":
