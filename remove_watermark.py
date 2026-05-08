@@ -773,6 +773,13 @@ def process_chunks(
         mask_tensor = mask_tensor.to(device_obj)
         flow_mask_tensor = flow_mask_tensor.to(device_obj)
 
+        # FP16 精度转换: 模型权重为 FP16 时，输入张量也必须为 FP16
+        # RAFT 内部会自行将输入转为 FP32，但 flow_complete 和 ProPainter 要求输入与权重同类型
+        if use_fp16:
+            frames_tensor = frames_tensor.half()
+            mask_tensor = mask_tensor.half()
+            flow_mask_tensor = flow_mask_tensor.half()
+
         # ====== 步骤 2: 计算光流 ======
         local_frames_tensor = frames_tensor[:, :l_t, :, :, :]
         local_mask = mask_tensor[:, :l_t, :, :]
