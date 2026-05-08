@@ -6,4 +6,7 @@ weights/
 *.pth
 temp_*/
 mask.png
+flow_mask.png
+output_clean.mp4
+*.tmp.mp4
 *.mp4
