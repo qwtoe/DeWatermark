@@ -17,7 +17,7 @@ import shutil
 import argparse
 import warnings
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
 
 warnings.filterwarnings("ignore")
 
@@ -514,117 +514,237 @@ def preprocess_frames_for_propainter(
     return frames_t, mask_t, flow_mask_t, original_size, process_size
 
 
-def compute_optical_flow(
-    local_frames: torch.Tensor,
-    flow_mask_tensor: torch.Tensor,
+def precompute_all_flows(
+    frame_paths: List[str],
+    mask: np.ndarray,
+    flow_mask: np.ndarray,
+    resize_to: Optional[int],
     fix_raft,
     fix_flow_complete,
     raft_iter: int = 20,
     use_fp16: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    device: str = "cuda",
+    chunk_size: int = 5,
+) -> List[Tuple[int, torch.Tensor, torch.Tensor]]:
     """
-    计算光流并补全。计算完成后 RAFT 模型可释放以节省显存。
+    预计算整个视频的所有光流并保存到 CPU 内存。
+    返回 [(start_idx, pred_flows_f_cpu, pred_flows_b_cpu), ...] 列表，
+    每个元组对应 chunk_size 个 flow pair（最后一组可能不足 chunk_size）。
+
+    每个 chunk 处理 (chunk_size + 1) 帧输入以产生 chunk_size 个 flow pair，
+    chunks 之间重叠 1 帧以确保跨块边界的 flow 也可用。
 
     Args:
-        local_frames: (1, T, 3, H, W) 本地帧张量 (在设备上)
-        flow_mask_tensor: (1, T, 1, H, W) 光流 mask
+        frame_paths: 所有帧路径列表
+        mask: (H, W) 二值 mask（仅用于预处理接口兼容，实际只用 flow_mask）
+        flow_mask: (H, W) 二值 flow_mask
+        resize_to: 可选降级分辨率
         fix_raft: RAFT 光流模型
-        fix_flow_complete: 流补全模型
+        fix_flow_complete: 循环流补全模型
         raft_iter: RAFT 迭代次数
-        use_fp16: 是否使用 FP16
-
-    Returns:
-        (pred_flows_f, pred_flows_b): 补全后的前向和后向光流
+        use_fp16: 半精度
+        device: 设备
+        chunk_size: 每批处理的 flow pair 数
     """
+    from PIL import Image
 
-    video_length = local_frames.size(1)
-    device = local_frames.device
+    total_frames = len(frame_paths)
+    device_obj = torch.device(device)
+    dummy_mask = np.zeros_like(flow_mask)  # flow 预计算不需要 mask
 
-    # ---- 1. 计算光流 (RAFT 用 FP32) ----
-    frame_size = local_frames.size(-1)
-    if frame_size <= 640:
-        short_clip_len = 12
-    elif frame_size <= 720:
-        short_clip_len = 8
-    elif frame_size <= 1280:
-        short_clip_len = 4
-    else:
-        short_clip_len = 2
+    print(f"\n预计算光流: {total_frames} 帧, 每批 {chunk_size} flow pairs")
+    flows_list: List[Tuple[int, torch.Tensor, torch.Tensor]] = []
+    pbar = tqdm(total=max(0, total_frames - 1), desc="光流预计算", unit="flow")
 
-    raft_input = local_frames.float()
+    for start_idx in range(0, total_frames - 1, chunk_size):
+        # 每个 chunk 取 (chunk_size + 1) 帧 → chunk_size 个 flow pair
+        end_idx = min(start_idx + chunk_size + 1, total_frames)
+        actual_num_flows = end_idx - start_idx - 1
+        if actual_num_flows <= 0:
+            break
 
-    if video_length > short_clip_len:
-        gt_flows_f_list, gt_flows_b_list = [], []
-        for f in range(0, video_length, short_clip_len):
-            end_f = min(video_length, f + short_clip_len)
-            if f == 0:
-                flows_f, flows_b = fix_raft(raft_input[:, f:end_f], iters=raft_iter)
+        neighbor_ids = list(range(start_idx, end_idx))
+        l_t = len(neighbor_ids)
+
+        # 加载帧
+        local_pils = [Image.open(frame_paths[i]).convert("RGB") for i in neighbor_ids]
+
+        # 预处理（只需要 frames_tensor 和 flow_mask_tensor）
+        frames_tensor, _, flow_mask_tensor, _, _ = \
+            preprocess_frames_for_propainter(
+                local_pils, dummy_mask, flow_mask, resize_to, num_local_frames=l_t
+            )
+        frames_tensor = frames_tensor.to(device_obj)
+        flow_mask_tensor = flow_mask_tensor.to(device_obj)
+        if use_fp16:
+            frames_tensor = frames_tensor.half()
+            flow_mask_tensor = flow_mask_tensor.half()
+
+        local_frames = frames_tensor[:, :l_t, :, :, :]
+
+        # ---- 计算光流 + 补全 ----
+        try:
+            with torch.inference_mode():
+                video_length = local_frames.size(1)
+                frame_size = local_frames.size(-1)
+
+                if frame_size <= 640:
+                    short_clip_len = 12
+                elif frame_size <= 720:
+                    short_clip_len = 8
+                elif frame_size <= 1280:
+                    short_clip_len = 4
+                else:
+                    short_clip_len = 2
+
+                raft_input = local_frames.float()
+
+                if video_length > short_clip_len:
+                    gt_flows_f_list, gt_flows_b_list = [], []
+                    for f in range(0, video_length, short_clip_len):
+                        end_f = min(video_length, f + short_clip_len)
+                        if f == 0:
+                            flows_f, flows_b = fix_raft(raft_input[:, f:end_f], iters=raft_iter)
+                        else:
+                            flows_f, flows_b = fix_raft(raft_input[:, f - 1:end_f], iters=raft_iter)
+                        gt_flows_f_list.append(flows_f)
+                        gt_flows_b_list.append(flows_b)
+                        del flows_f, flows_b
+                        torch.cuda.empty_cache()
+
+                    gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
+                    gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
+                    del gt_flows_f_list, gt_flows_b_list
+                    gt_flows_bi = (gt_flows_f, gt_flows_b)
+                else:
+                    gt_flows_bi = fix_raft(raft_input, iters=raft_iter)
+                    torch.cuda.empty_cache()
+
+                del raft_input
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+                if use_fp16:
+                    gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
+                    torch.cuda.empty_cache()
+
+                # 流补全
+                subvideo_length = 80
+                flow_length = gt_flows_bi[0].size(1)
+
+                if flow_length > subvideo_length:
+                    pred_flows_f, pred_flows_b = [], []
+                    pad_len = 5
+                    for f in range(0, flow_length, subvideo_length):
+                        s_f = max(0, f - pad_len)
+                        e_f = min(flow_length, f + subvideo_length + pad_len)
+                        pad_len_s = max(0, f) - s_f
+                        pad_len_e = e_f - min(flow_length, f + subvideo_length)
+
+                        pred_flows_bi_sub, _ = fix_flow_complete.forward_bidirect_flow(
+                            (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
+                            flow_mask_tensor[:, s_f:e_f + 1]
+                        )
+                        pred_flows_bi_sub = fix_flow_complete.combine_flow(
+                            (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
+                            pred_flows_bi_sub,
+                            flow_mask_tensor[:, s_f:e_f + 1]
+                        )
+                        pred_flows_f.append(pred_flows_bi_sub[0][:, pad_len_s:e_f - s_f - pad_len_e])
+                        pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s:e_f - s_f - pad_len_e])
+                        torch.cuda.empty_cache()
+
+                    pred_flows_f = torch.cat(pred_flows_f, dim=1)
+                    pred_flows_b = torch.cat(pred_flows_b, dim=1)
+                else:
+                    pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_mask_tensor)
+                    pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_mask_tensor)
+                    pred_flows_f = pred_flows_bi[0]
+                    pred_flows_b = pred_flows_bi[1]
+                    torch.cuda.empty_cache()
+
+                del gt_flows_bi
+                torch.cuda.empty_cache()
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"\n  [OOM] 光流预计算显存不足，清理后重试...")
+                _cleanup_memory(verbose=True)
+                # 单次重试
+                with torch.inference_mode():
+                    raft_input = local_frames.float()
+                    gt_flows_bi = fix_raft(raft_input, iters=raft_iter)
+                    del raft_input
+                    torch.cuda.empty_cache()
+                    if use_fp16:
+                        gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
+                    pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_mask_tensor)
+                    pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_mask_tensor)
+                    pred_flows_f = pred_flows_bi[0]
+                    pred_flows_b = pred_flows_bi[1]
+                    del gt_flows_bi
+                    torch.cuda.empty_cache()
             else:
-                flows_f, flows_b = fix_raft(raft_input[:, f - 1:end_f], iters=raft_iter)
+                raise
 
-            gt_flows_f_list.append(flows_f)
-            gt_flows_b_list.append(flows_b)
-            del flows_f, flows_b
-            torch.cuda.empty_cache()
-
-        gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
-        gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
-        del gt_flows_f_list, gt_flows_b_list
-        gt_flows_bi = (gt_flows_f, gt_flows_b)
-    else:
-        gt_flows_bi = fix_raft(raft_input, iters=raft_iter)
+        # 移到 CPU 并截断到实际 flow 数量
+        pred_flows_f_cpu = pred_flows_f[:, :actual_num_flows].cpu()
+        pred_flows_b_cpu = pred_flows_b[:, :actual_num_flows].cpu()
+        del pred_flows_f, pred_flows_b
         torch.cuda.empty_cache()
 
-    # 释放 RAFT FP32 输入
-    del raft_input
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+        flows_list.append((start_idx, pred_flows_f_cpu, pred_flows_b_cpu))
 
-    # ---- FP16 转换 ----
-    if use_fp16:
-        gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
-        torch.cuda.empty_cache()
+        # 清理
+        del frames_tensor, flow_mask_tensor, local_frames, local_pils
+        _cleanup_memory(verbose=(start_idx % (chunk_size * 10) == 0))
 
-    # ---- 2. 流补全 ----
-    subvideo_length = 80
-    flow_length = gt_flows_bi[0].size(1)
+        pbar.update(actual_num_flows)
 
-    if flow_length > subvideo_length:
-        pred_flows_f, pred_flows_b = [], []
-        pad_len = 5
-        for f in range(0, flow_length, subvideo_length):
-            s_f = max(0, f - pad_len)
-            e_f = min(flow_length, f + subvideo_length + pad_len)
-            pad_len_s = max(0, f) - s_f
-            pad_len_e = e_f - min(flow_length, f + subvideo_length)
+    pbar.close()
+    print(f"光流预计算完成: {len(flows_list)} 块")
+    return flows_list
 
-            pred_flows_bi_sub, _ = fix_flow_complete.forward_bidirect_flow(
-                (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
-                flow_mask_tensor[:, s_f:e_f + 1]
-            )
-            pred_flows_bi_sub = fix_flow_complete.combine_flow(
-                (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
-                pred_flows_bi_sub,
-                flow_mask_tensor[:, s_f:e_f + 1]
-            )
-            pred_flows_f.append(pred_flows_bi_sub[0][:, pad_len_s:e_f - s_f - pad_len_e])
-            pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s:e_f - s_f - pad_len_e])
-            torch.cuda.empty_cache()
 
-        pred_flows_f = torch.cat(pred_flows_f, dim=1)
-        pred_flows_b = torch.cat(pred_flows_b, dim=1)
-    else:
-        pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_mask_tensor)
-        pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_mask_tensor)
-        pred_flows_f = pred_flows_bi[0]
-        pred_flows_b = pred_flows_bi[1]
-        torch.cuda.empty_cache()
+def _get_flows_for_window(
+    window_start: int,
+    window_end: int,
+    precomputed_flows: List[Tuple[int, torch.Tensor, torch.Tensor]],
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """
+    从预计算的光流列表中提取指定窗口 [window_start, window_end) 所需 flows。
+    返回 (flows_f, flows_b) CPU tensor，若未找到则返回 (None, None)。
 
-    # 释放原始光流
-    del gt_flows_bi
-    torch.cuda.empty_cache()
+    window 有 T 帧时需要 T-1 个 flow pair（索引从 window_start 到 window_end-2）。
+    """
+    need_start = window_start
+    need_end = window_end - 1  # 最后一个 flow pair 的索引（不含）
+    if need_end <= need_start:
+        return None, None
 
-    return pred_flows_f, pred_flows_b
+    flows_f_parts: List[torch.Tensor] = []
+    flows_b_parts: List[torch.Tensor] = []
+
+    for chunk_start, chunk_flows_f, chunk_flows_b in precomputed_flows:
+        num_flows = chunk_flows_f.size(1)
+        chunk_end = chunk_start + num_flows  # 此 chunk 覆盖的 flow 索引区间 [start, end)
+
+        # 检查是否有交集
+        if chunk_end <= need_start or chunk_start >= need_end:
+            continue
+
+        part_start = max(need_start, chunk_start)
+        part_end = min(need_end, chunk_end)
+        offset = part_start - chunk_start
+        length = part_end - part_start
+
+        flows_f_parts.append(chunk_flows_f[:, offset:offset + length])
+        flows_b_parts.append(chunk_flows_b[:, offset:offset + length])
+
+    if not flows_f_parts:
+        return None, None
+
+    return torch.cat(flows_f_parts, dim=1), torch.cat(flows_b_parts, dim=1)
 
 
 def _cleanup_memory(verbose: bool = False):
@@ -645,13 +765,11 @@ def process_chunks(
     mask: np.ndarray,
     flow_mask: np.ndarray,
     output_dir: str,
-    fix_raft,
-    fix_flow_complete,
     model,
+    precomputed_flows: List[Tuple[int, torch.Tensor, torch.Tensor]],
     chunk_size: int = 5,
     resize_to: Optional[int] = None,
     use_fp16: bool = True,
-    raft_iter: int = 20,
     device: str = "cuda",
     neighbor_length: Optional[int] = None,
     ref_stride: int = 10,
@@ -660,29 +778,22 @@ def process_chunks(
     """
     滑动窗口推理 — 核心处理函数。
 
-    使用滑动窗口 + 参考帧策略，与 ProPainter 官方推理逻辑对齐：
-    1. 每个窗口包含 neighbor_length 帧本地帧 + 若干参考帧
-    2. 参考帧提供全局上下文，mask 为零（无水印）
+    使用预计算光流 + 滑动窗口 + 参考帧策略：
+    1. 光流已由 precompute_all_flows() 预计算并保存在 CPU 内存中
+    2. 每个窗口包含 neighbor_length 帧本地帧 + 若干参考帧
     3. 模型输出仅在 mask 区域使用修复结果，非 mask 区域保留原始像素
-    4. 重叠区域取多次推理的平均值
-
-    显存优化策略：
-    - RAFT 光流模型在计算完光流后立即释放，节省约 200MB 显存
-    - 光流预计算并缓存到磁盘，避免重复计算
-    - 低显存时自动禁用参考帧和减小窗口大小
+    4. 重叠帧通过即时读取+回写磁盘实现平均（无需巨型 frame_accum 数组）
 
     Args:
         frame_paths: 所有帧路径列表
         mask: (H, W) 二值 mask (255=水印区域，已膨胀5次)
         flow_mask: (H, W) 二值 flow_mask (255=水印区域，已膨胀8次)
         output_dir: 输出帧目录
-        fix_raft: RAFT 光流模型
-        fix_flow_complete: 流补全模型
         model: ProPainter 修复模型
+        precomputed_flows: precompute_all_flows() 返回的预计算光流列表
         chunk_size: 每批处理帧数 (默认5，显存紧张可降到3)
         resize_to: 降级分辨率 (如 480)
         use_fp16: 半精度
-        raft_iter: RAFT 迭代次数
         device: 设备
         neighbor_length: 滑动窗口大小 (默认=chunk_size*2)
         ref_stride: 参考帧选取步长
@@ -693,6 +804,7 @@ def process_chunks(
     total_frames = len(frame_paths)
     device_obj = torch.device(device)
     use_cuda = device_obj.type == "cuda"
+    accum_dtype = np.float32
 
     if neighbor_length is None:
         neighbor_length = min(chunk_size * 2, total_frames)
@@ -719,7 +831,6 @@ def process_chunks(
     ref_frames_pil = {}
     if use_ref_frames:
         ref_indices = get_ref_index(0, [], total_frames, ref_stride=ref_stride)
-        # 限制参考帧数量
         if len(ref_indices) > max_ref_frames:
             step = len(ref_indices) / max_ref_frames
             ref_indices = [ref_indices[int(i * step)] for i in range(max_ref_frames)]
@@ -730,18 +841,11 @@ def process_chunks(
             except Exception as e:
                 print(f"  WARNING: 无法加载参考帧 {idx}: {e}")
 
-    # 累积结果和计数（用于重叠区域平均）
-    first_frame = cv2.imread(frame_paths[0])
-    if first_frame is None:
-        raise RuntimeError(f"无法读取第一帧: {frame_paths[0]}")
-    orig_h, orig_w = first_frame.shape[:2]
-    del first_frame
-    accum_dtype = np.float32
-    frame_accum = np.zeros((total_frames, orig_h, orig_w, 3), dtype=accum_dtype)
-    frame_count = np.zeros(total_frames, dtype=accum_dtype)
-
     # 准备 mask（原始分辨率，3通道，用于混合）
     mask_3ch = np.stack([mask] * 3, axis=-1).astype(accum_dtype) / 255.0  # (H, W, 3)
+
+    # frame_count 字典跟踪每个帧被写入的次数（用于重叠平均）
+    frame_count: Dict[int, int] = {}
 
     pbar = tqdm(total=total_frames, desc="推理进度", unit="帧")
 
@@ -754,7 +858,6 @@ def process_chunks(
         if use_ref_frames:
             mid_id = (window_start + window_end) // 2
             ref_ids = get_ref_index(mid_id, neighbor_ids, total_frames, ref_stride=ref_stride)
-            # 过滤掉无法加载的参考帧
             ref_ids = [i for i in ref_ids if i in ref_frames_pil]
 
         # 本地帧 + 参考帧
@@ -764,140 +867,235 @@ def process_chunks(
         l_t = len(local_pils)
 
         # ====== 步骤 1: 预处理 ======
-        frames_tensor, mask_tensor, flow_mask_tensor, original_size, process_size = \
+        frames_tensor, mask_tensor, _, original_size, process_size = \
             preprocess_frames_for_propainter(
                 all_pils, mask, flow_mask, resize_to, num_local_frames=l_t
             )
 
         frames_tensor = frames_tensor.to(device_obj)
         mask_tensor = mask_tensor.to(device_obj)
-        flow_mask_tensor = flow_mask_tensor.to(device_obj)
 
-        # FP16 精度转换: 模型权重为 FP16 时，输入张量也必须为 FP16
-        # RAFT 内部会自行将输入转为 FP32，但 flow_complete 和 ProPainter 要求输入与权重同类型
         if use_fp16:
             frames_tensor = frames_tensor.half()
             mask_tensor = mask_tensor.half()
-            flow_mask_tensor = flow_mask_tensor.half()
 
-        # ====== 步骤 2: 计算光流 ======
         local_frames_tensor = frames_tensor[:, :l_t, :, :, :]
         local_mask = mask_tensor[:, :l_t, :, :]
 
+        # ====== 步骤 2: 使用预计算光流 ======
+        pred_flows_f_cpu, pred_flows_b_cpu = _get_flows_for_window(
+            window_start, window_end, precomputed_flows
+        )
+        if pred_flows_f_cpu is None:
+            print(f"\n  WARNING: 窗口 [{window_start}, {window_end}) 无预计算光流，跳过")
+            for i, idx in enumerate(neighbor_ids):
+                _write_or_average_frame(frame_paths, output_dir, idx, None, mask_3ch, frame_count)
+            pbar.update(len(neighbor_ids))
+            continue
+
+        # ====== 步骤 3: 图像传播 + Transformer 推理 ======
         try:
+            pred_flows_f = pred_flows_f_cpu.to(device_obj)
+            pred_flows_b = pred_flows_b_cpu.to(device_obj)
+            if use_fp16:
+                pred_flows_f = pred_flows_f.half()
+                pred_flows_b = pred_flows_b.half()
+
+            masked_frames = local_frames_tensor * (1 - local_mask)
+
             with torch.inference_mode():
-                pred_flows_f, pred_flows_b = compute_optical_flow(
-                    local_frames_tensor, flow_mask_tensor,
-                    fix_raft, fix_flow_complete,
-                    raft_iter=raft_iter, use_fp16=use_fp16,
+                updated_frames, updated_masks = model.img_propagation(
+                    masked_frames, (pred_flows_f, pred_flows_b), local_mask, "nearest"
                 )
+                torch.cuda.empty_cache()
+
+                updated_frames = local_frames_tensor * (1 - local_mask) + \
+                                 updated_frames.view(local_frames_tensor.shape) * local_mask
+
+            # ====== 步骤 4: Transformer 推理 ======
+            if use_ref_frames and len(ref_ids) > 0:
+                ref_masks = mask_tensor[:, l_t:, :, :]
+                all_updated_masks = torch.cat([updated_masks, ref_masks], dim=1)
+            else:
+                all_updated_masks = updated_masks
+
+            with torch.inference_mode():
+                comp_frames = model(
+                    masked_frames=frames_tensor * (1 - mask_tensor),
+                    completed_flows=(pred_flows_f, pred_flows_b),
+                    masks_in=mask_tensor,
+                    masks_updated=all_updated_masks,
+                    num_local_frames=l_t,
+                )
+                torch.cuda.empty_cache()
+
+            # ====== 步骤 5: 后处理 ======
+            result_np = comp_frames.squeeze(0).float().cpu().numpy()
+            result_np = (result_np + 1.0) / 2.0
+            result_np = np.clip(result_np * 255, 0, 255).astype(np.uint8)
+            result_np = result_np.transpose(0, 2, 3, 1)
+
+            if process_size != original_size:
+                resized_results = []
+                for i in range(result_np.shape[0]):
+                    img = cv2.resize(result_np[i], original_size, interpolation=cv2.INTER_LANCZOS4)
+                    resized_results.append(img)
+                result_np = np.stack(resized_results)
+
+            # 混合并写入磁盘
+            for i, idx in enumerate(neighbor_ids):
+                orig_frame = cv2.imread(frame_paths[idx])
+                if orig_frame is None:
+                    print(f"  WARNING: 无法读取帧 {idx}")
+                    continue
+                orig_frame = cv2.cvtColor(orig_frame, cv2.COLOR_BGR2RGB)
+
+                blended = result_np[i].astype(accum_dtype) * mask_3ch + \
+                          orig_frame.astype(accum_dtype) * (1 - mask_3ch)
+                blended = blended.astype(np.uint8)
+
+                _write_or_average_frame(frame_paths, output_dir, idx, blended, mask_3ch, frame_count)
+
+            # 清理
+            del pred_flows_f, pred_flows_b
+            del comp_frames, result_np
+            del updated_frames, updated_masks, all_updated_masks, masked_frames
+
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                print(f"\n  [OOM] 光流计算显存不足，尝试释放缓存后重试...")
+                print(f"\n  [OOM] 推理显存不足，清理后重试...")
                 _cleanup_memory(verbose=True)
-                torch.cuda.empty_cache()
-                with torch.inference_mode():
-                    pred_flows_f, pred_flows_b = compute_optical_flow(
-                        local_frames_tensor, flow_mask_tensor,
-                        fix_raft, fix_flow_complete,
-                        raft_iter=raft_iter, use_fp16=use_fp16,
-                    )
+
+                try:
+                    # 重试：重新获取光流 + 重新推理
+                    pred_flows_f = pred_flows_f_cpu.to(device_obj)
+                    pred_flows_b = pred_flows_b_cpu.to(device_obj)
+                    if use_fp16:
+                        pred_flows_f = pred_flows_f.half()
+                        pred_flows_b = pred_flows_b.half()
+
+                    masked_frames = local_frames_tensor * (1 - local_mask)
+                    with torch.inference_mode():
+                        updated_frames, updated_masks = model.img_propagation(
+                            masked_frames, (pred_flows_f, pred_flows_b), local_mask, "nearest"
+                        )
+                        torch.cuda.empty_cache()
+                        updated_frames = local_frames_tensor * (1 - local_mask) + \
+                                         updated_frames.view(local_frames_tensor.shape) * local_mask
+
+                    if use_ref_frames and len(ref_ids) > 0:
+                        ref_masks = mask_tensor[:, l_t:, :, :]
+                        all_updated_masks = torch.cat([updated_masks, ref_masks], dim=1)
+                    else:
+                        all_updated_masks = updated_masks
+
+                    with torch.inference_mode():
+                        comp_frames = model(
+                            masked_frames=frames_tensor * (1 - mask_tensor),
+                            completed_flows=(pred_flows_f, pred_flows_b),
+                            masks_in=mask_tensor,
+                            masks_updated=all_updated_masks,
+                            num_local_frames=l_t,
+                        )
+                        torch.cuda.empty_cache()
+
+                    result_np = comp_frames.squeeze(0).float().cpu().numpy()
+                    result_np = (result_np + 1.0) / 2.0
+                    result_np = np.clip(result_np * 255, 0, 255).astype(np.uint8)
+                    result_np = result_np.transpose(0, 2, 3, 1)
+
+                    if process_size != original_size:
+                        resized_results = []
+                        for i in range(result_np.shape[0]):
+                            img = cv2.resize(result_np[i], original_size, interpolation=cv2.INTER_LANCZOS4)
+                            resized_results.append(img)
+                        result_np = np.stack(resized_results)
+
+                    for i, idx in enumerate(neighbor_ids):
+                        orig_frame = cv2.imread(frame_paths[idx])
+                        if orig_frame is None:
+                            continue
+                        orig_frame = cv2.cvtColor(orig_frame, cv2.COLOR_BGR2RGB)
+                        blended = result_np[i].astype(accum_dtype) * mask_3ch + \
+                                  orig_frame.astype(accum_dtype) * (1 - mask_3ch)
+                        blended = blended.astype(np.uint8)
+                        _write_or_average_frame(frame_paths, output_dir, idx, blended, mask_3ch, frame_count)
+
+                    del pred_flows_f, pred_flows_b, comp_frames, result_np
+                    del updated_frames, updated_masks, all_updated_masks, masked_frames
+
+                except RuntimeError as e2:
+                    if "out of memory" in str(e2).lower():
+                        print(f"\n  [OOM] 重试仍失败，对窗口 [{window_start}, {window_end}) 使用原始帧 fallback")
+                        _cleanup_memory(verbose=True)
+                        for i, idx in enumerate(neighbor_ids):
+                            _write_or_average_frame(frame_paths, output_dir, idx, None, mask_3ch, frame_count)
+                    else:
+                        raise
             else:
                 raise
 
-        # ====== 步骤 3: 图像传播 ======
-        masked_frames = local_frames_tensor * (1 - local_mask)
-
-        with torch.inference_mode():
-            updated_frames, updated_masks = model.img_propagation(
-                masked_frames, (pred_flows_f, pred_flows_b), local_mask, "nearest"
-            )
-            torch.cuda.empty_cache()
-
-            # 关键修复: 将传播结果与原始帧混合
-            updated_frames = local_frames_tensor * (1 - local_mask) + \
-                             updated_frames.view(local_frames_tensor.shape) * local_mask
-
-        # ====== 步骤 4: 构建完整输入 + Transformer 推理 ======
-        if use_ref_frames and len(ref_ids) > 0:
-            # 有参考帧: 拼接本地帧和参考帧
-            ref_masks = mask_tensor[:, l_t:, :, :]  # 参考帧 mask 为零
-            all_updated_masks = torch.cat([updated_masks, ref_masks], dim=1)
-        else:
-            # 无参考帧: 仅使用本地帧
-            all_updated_masks = updated_masks
-
-        with torch.inference_mode():
-            comp_frames = model(
-                masked_frames=frames_tensor * (1 - mask_tensor),
-                completed_flows=(pred_flows_f, pred_flows_b),
-                masks_in=mask_tensor,
-                masks_updated=all_updated_masks,
-                num_local_frames=l_t,
-            )
-            torch.cuda.empty_cache()
-
-        # ====== 步骤 5: 后处理 + 与原始帧混合 ======
-        # comp_frames: (1, l_t, 3, H, W) in [-1, 1]
-        result_np = comp_frames.squeeze(0).float().cpu().numpy()  # (l_t, 3, H, W)
-        result_np = (result_np + 1.0) / 2.0  # [-1,1] → [0,1]
-        result_np = np.clip(result_np * 255, 0, 255).astype(np.uint8)
-        result_np = result_np.transpose(0, 2, 3, 1)  # (l_t, H, W, 3)
-
-        # 如果推理时缩放了，还原回原始尺寸
-        if process_size != original_size:
-            resized_results = []
-            for i in range(result_np.shape[0]):
-                img = cv2.resize(result_np[i], original_size, interpolation=cv2.INTER_LANCZOS4)
-                resized_results.append(img)
-            result_np = np.stack(resized_results)
-
-        # 加载原始帧并与模型输出混合
-        # 关键修复: 仅在 mask 区域使用模型输出，非 mask 区域保留原始像素
-        for i, idx in enumerate(neighbor_ids):
-            orig_frame = cv2.imread(frame_paths[idx])
-            if orig_frame is None:
-                print(f"  WARNING: 无法读取帧 {idx}")
-                continue
-            orig_frame = cv2.cvtColor(orig_frame, cv2.COLOR_BGR2RGB)
-
-            # 混合: mask 区域使用模型输出，非 mask 区域保留原始像素
-            blended = result_np[i].astype(accum_dtype) * mask_3ch + \
-                      orig_frame.astype(accum_dtype) * (1 - mask_3ch)
-            blended = blended.astype(np.uint8)
-
-            # 累积结果（用于重叠区域平均）
-            frame_accum[idx] += blended.astype(accum_dtype)
-            frame_count[idx] += 1
-
-        # ====== 步骤 6: 内存清理 ======
-        del frames_tensor, mask_tensor, flow_mask_tensor
-        del local_frames_tensor, local_mask, masked_frames
-        del updated_frames, updated_masks, all_updated_masks
-        del pred_flows_f, pred_flows_b
-        del comp_frames, result_np
+        # ====== 内存清理（窗口结束） ======
+        del frames_tensor, mask_tensor
+        del local_frames_tensor, local_mask
         del local_pils, ref_pils, all_pils
         _cleanup_memory(verbose=(window_start % (neighbor_stride * 10) == 0))
 
-        pbar.update(len(neighbor_ids) - max(0, window_start + len(neighbor_ids) - total_frames) if window_start + len(neighbor_ids) > total_frames else len(neighbor_ids))
+        pbar.update(len(neighbor_ids))
 
     pbar.close()
 
-    # ====== 步骤 7: 计算平均值并保存 ======
-    print("\n保存输出帧...")
+    # 确保所有帧都已写入（未处理的帧用原始帧补全）
     for idx in range(total_frames):
-        if frame_count[idx] > 0:
-            avg_frame = (frame_accum[idx] / frame_count[idx]).astype(np.uint8)
-        else:
-            # 未处理的帧，使用原始帧
+        if idx not in frame_count:
             orig = cv2.imread(frame_paths[idx])
-            avg_frame = cv2.cvtColor(orig, cv2.COLOR_BGR2RGB)
-
-        out_path = os.path.join(output_dir, f"frame_{idx:06d}.jpg")
-        cv2.imwrite(out_path, cv2.cvtColor(avg_frame, cv2.COLOR_RGB2BGR))
+            if orig is not None:
+                out_path = os.path.join(output_dir, f"frame_{idx:06d}.jpg")
+                cv2.imwrite(out_path, orig)
 
     print(f"\n推理完成! 输出帧: {output_dir}")
     _cleanup_memory(verbose=True)
+
+
+def _write_or_average_frame(
+    frame_paths: List[str],
+    output_dir: str,
+    idx: int,
+    blended: Optional[np.ndarray],
+    mask_3ch: np.ndarray,
+    frame_count: Dict[int, int],
+) -> None:
+    """
+    将 blended 帧写入磁盘。如果是重叠帧（已存在），则读取已有帧并做平均后回写。
+    若 blended 为 None（OOM fallback），则直接使用原始帧。
+    """
+    out_path = os.path.join(output_dir, f"frame_{idx:06d}.jpg")
+
+    if blended is None:
+        # OOM fallback: 使用原始帧
+        orig = cv2.imread(frame_paths[idx])
+        if orig is None:
+            return
+        cv2.imwrite(out_path, orig)
+        frame_count[idx] = frame_count.get(idx, 0) + 1
+        return
+
+    if idx not in frame_count:
+        # 首次写入
+        cv2.imwrite(out_path, cv2.cvtColor(blended, cv2.COLOR_RGB2BGR))
+        frame_count[idx] = 1
+    else:
+        # 重叠帧：读取已有帧，加权平均后回写
+        existing = cv2.imread(out_path)
+        if existing is None:
+            cv2.imwrite(out_path, cv2.cvtColor(blended, cv2.COLOR_RGB2BGR))
+            frame_count[idx] = 1
+            return
+        existing_rgb = cv2.cvtColor(existing, cv2.COLOR_BGR2RGB)
+        n = frame_count[idx]
+        averaged = ((existing_rgb.astype(np.float32) * n + blended.astype(np.float32)) / (n + 1)).astype(np.uint8)
+        cv2.imwrite(out_path, cv2.cvtColor(averaged, cv2.COLOR_RGB2BGR))
+        frame_count[idx] = n + 1
 
 
 def reconstruct_video(
@@ -1072,7 +1270,7 @@ def main():
 
     # ====== 环境检测 ======
     print("=" * 60)
-    print("DeWatermark v2.1 — ProPainter Video Watermark Removal")
+    print("DeWatermark v2.2 — ProPainter Video Watermark Removal")
     print("=" * 60)
 
     use_cuda = not args.no_cuda and torch.cuda.is_available()
@@ -1207,20 +1405,38 @@ def main():
                 device=device_str,
             )
 
+            # ====== 步骤 3b: 预计算光流 ======
+            print(f"\n[步骤 3b/5] 预计算全视频光流...")
+            flows_list = precompute_all_flows(
+                frame_paths=frame_paths,
+                mask=mask,
+                flow_mask=flow_mask,
+                resize_to=args.resize if isinstance(args.resize, int) else None,
+                fix_raft=fix_raft,
+                fix_flow_complete=fix_flow_complete,
+                raft_iter=args.raft_iter,
+                use_fp16=use_fp16,
+                device=device_str,
+                chunk_size=args.chunk_size,
+            )
+
+            # 释放 RAFT 模型（不再需要）
+            print("  释放 RAFT 模型...")
+            del fix_raft
+            _cleanup_memory(verbose=True)
+
             # ====== 步骤 4: 滑动窗口推理 ======
-            print(f"\n[步骤 4/5] 开始去水印推理...")
+            print(f"\n[步骤 4/5] 开始去水印推理（使用预计算光流）...")
             process_chunks(
                 frame_paths=frame_paths,
                 mask=mask,
                 flow_mask=flow_mask,
                 output_dir=frames_output_dir,
-                fix_raft=fix_raft,
-                fix_flow_complete=fix_flow_complete,
                 model=model,
+                precomputed_flows=flows_list,
                 chunk_size=args.chunk_size,
                 resize_to=args.resize if isinstance(args.resize, int) else None,
                 use_fp16=use_fp16,
-                raft_iter=args.raft_iter,
                 device=device_str,
                 neighbor_length=args.neighbor_length,
                 ref_stride=args.ref_stride,
@@ -1228,7 +1444,7 @@ def main():
             )
 
             # 释放模型
-            del fix_raft, fix_flow_complete, model
+            del fix_flow_complete, model
             _cleanup_memory(verbose=True)
             print("模型已释放")
 
