@@ -56,7 +56,9 @@ The pipeline runs in this exact order — do not reorder:
 | Accumulating all frames in RAM | System swap → GPU OOM | Write frames to disk immediately, no numpy accumulation |
 | Missing audio in output | Silent video | `reconstruct_video()` merges audio via FFmpeg `-map 1:a:0?` |
 | Flow completion in FP16 produces NaN | Black watermark region in output | Force FP32 for flow completion network (`fix_flow_complete.float()`) |
+| ProPainter model in FP16 produces NaN | Black watermark region in output | Force FP32 for ProPainter inference (`model.float()` during inference windows) |
 | Transformer receives zero-masked frames | Black watermark region in output | Pass `updated_frames` (from img_propagation) to transformer, not `frames_tensor * (1 - mask)` |
+| Stale flow cache with NaN data | NaN flows loaded from cache, black output | Cache loading validates for NaN and auto-invalidates |
 
 ## CLI Parameters (Non-Obvious Defaults)
 

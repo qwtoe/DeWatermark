@@ -1034,6 +1034,11 @@ def process_chunks(
             continue
 
         # ====== Step 3: Image propagation + Transformer inference ======
+        # Force FP32 for ProPainter model inference to prevent NaN output.
+        # The model's Conv3D/attention layers are numerically unstable in FP16.
+        if use_fp16:
+            model.float()
+
         try:
             pred_flows_f = pred_flows_f_cpu.to(device_obj)
             pred_flows_b = pred_flows_b_cpu.to(device_obj)
@@ -1047,15 +1052,15 @@ def process_chunks(
                 pred_flows_f = torch.nan_to_num(pred_flows_f, nan=0.0)
                 pred_flows_b = torch.nan_to_num(pred_flows_b, nan=0.0)
 
-            if use_fp16:
-                pred_flows_f = pred_flows_f.half()
-                pred_flows_b = pred_flows_b.half()
+            # All inference tensors must be FP32 when model is FP32
+            pred_flows_f = pred_flows_f.float()
+            pred_flows_b = pred_flows_b.float()
 
-            masked_frames = local_frames_tensor * (1 - local_mask)
+            masked_frames = local_frames_tensor.float() * (1 - local_mask.float())
 
             with torch.inference_mode():
                 updated_frames, updated_masks = model.img_propagation(
-                    masked_frames, (pred_flows_f, pred_flows_b), local_mask, "nearest"
+                    masked_frames, (pred_flows_f, pred_flows_b), local_mask.float(), "nearest"
                 )
                 torch.cuda.empty_cache()
 
@@ -1067,8 +1072,8 @@ def process_chunks(
                 _save_debug_tensor(masked_frames, os.path.join(debug_dir, "step1_masked_input.png"), "masked_frames (input to img_propagation)")
                 _save_debug_tensor(updated_frames, os.path.join(debug_dir, "step2a_raw_propagation.png"), "raw img_propagation output (before blending)")
 
-            updated_frames = local_frames_tensor * (1 - local_mask) + \
-                             updated_frames.view(local_frames_tensor.shape) * local_mask
+            updated_frames = local_frames_tensor.float() * (1 - local_mask.float()) + \
+                             updated_frames.view(local_frames_tensor.shape) * local_mask.float()
 
             # Debug: save blended propagation result
             if debug_dir and is_first_window:
@@ -1076,10 +1081,10 @@ def process_chunks(
 
             # ====== Step 4: Transformer inference ======
             if use_ref_frames and len(ref_ids) > 0:
-                ref_masks = mask_tensor[:, l_t:, :, :]
+                ref_masks = mask_tensor[:, l_t:, :, :].float()
                 all_updated_masks = torch.cat([updated_masks, ref_masks], dim=1)
                 # Concatenate propagated local frames with original reference frames
-                full_updated_frames = torch.cat([updated_frames, frames_tensor[:, l_t:]], dim=1)
+                full_updated_frames = torch.cat([updated_frames, frames_tensor[:, l_t:].float()], dim=1)
             else:
                 all_updated_masks = updated_masks
                 full_updated_frames = updated_frames
@@ -1088,7 +1093,7 @@ def process_chunks(
                 comp_frames = model(
                     masked_frames=full_updated_frames,
                     completed_flows=(pred_flows_f, pred_flows_b),
-                    masks_in=mask_tensor,
+                    masks_in=mask_tensor.float(),
                     masks_updated=all_updated_masks,
                     num_local_frames=l_t,
                 )
@@ -1139,37 +1144,47 @@ def process_chunks(
             del comp_frames, result_np
             del updated_frames, updated_masks, all_updated_masks, masked_frames
 
+            # Restore model to FP16 for memory savings between windows
+            if use_fp16:
+                model.half()
+
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 print(f"\n  [OOM] Inference out of VRAM, cleaning up and retrying...")
                 _cleanup_memory(verbose=True)
 
-                try:
-                    # Retry: re-fetch flows + re-run inference
-                    pred_flows_f = pred_flows_f_cpu.to(device_obj)
-                    pred_flows_b = pred_flows_b_cpu.to(device_obj)
-                    if use_fp16:
-                        pred_flows_f = pred_flows_f.half()
-                        pred_flows_b = pred_flows_b.half()
+                # Ensure model is in FP32 for retry
+                if use_fp16:
+                    model.float()
 
-                    masked_frames = local_frames_tensor * (1 - local_mask)
+                try:
+                    # Retry: re-fetch flows + re-run inference (all FP32)
+                    pred_flows_f = pred_flows_f_cpu.to(device_obj).float()
+                    pred_flows_b = pred_flows_b_cpu.to(device_obj).float()
+
+                    # Check for NaN in flows
+                    if torch.isnan(pred_flows_f).any() or torch.isnan(pred_flows_b).any():
+                        pred_flows_f = torch.nan_to_num(pred_flows_f, nan=0.0)
+                        pred_flows_b = torch.nan_to_num(pred_flows_b, nan=0.0)
+
+                    masked_frames = local_frames_tensor.float() * (1 - local_mask.float())
                     with torch.inference_mode():
                         updated_frames, updated_masks = model.img_propagation(
-                            masked_frames, (pred_flows_f, pred_flows_b), local_mask, "nearest"
+                            masked_frames, (pred_flows_f, pred_flows_b), local_mask.float(), "nearest"
                         )
                         torch.cuda.empty_cache()
 
                     if debug_dir and is_first_window:
                         _save_debug_tensor(updated_frames, os.path.join(debug_dir, "step2a_raw_propagation_retry.png"), "raw img_propagation output (OOM retry, before blending)")
 
-                    updated_frames = local_frames_tensor * (1 - local_mask) + \
-                                     updated_frames.view(local_frames_tensor.shape) * local_mask
+                    updated_frames = local_frames_tensor.float() * (1 - local_mask.float()) + \
+                                     updated_frames.view(local_frames_tensor.shape) * local_mask.float()
 
                     if use_ref_frames and len(ref_ids) > 0:
-                        ref_masks = mask_tensor[:, l_t:, :, :]
+                        ref_masks = mask_tensor[:, l_t:, :, :].float()
                         all_updated_masks = torch.cat([updated_masks, ref_masks], dim=1)
                         # Concatenate propagated local frames with original reference frames
-                        full_updated_frames = torch.cat([updated_frames, frames_tensor[:, l_t:]], dim=1)
+                        full_updated_frames = torch.cat([updated_frames, frames_tensor[:, l_t:].float()], dim=1)
                     else:
                         all_updated_masks = updated_masks
                         full_updated_frames = updated_frames
@@ -1178,7 +1193,7 @@ def process_chunks(
                         comp_frames = model(
                             masked_frames=full_updated_frames,
                             completed_flows=(pred_flows_f, pred_flows_b),
-                            masks_in=mask_tensor,
+                            masks_in=mask_tensor.float(),
                             masks_updated=all_updated_masks,
                             num_local_frames=l_t,
                         )
@@ -1209,15 +1224,28 @@ def process_chunks(
                     del pred_flows_f, pred_flows_b, comp_frames, result_np
                     del updated_frames, updated_masks, all_updated_masks, masked_frames
 
+                    # Restore model to FP16 after retry
+                    if use_fp16:
+                        model.half()
+
                 except RuntimeError as e2:
                     if "out of memory" in str(e2).lower():
                         print(f"\n  [OOM] Retry still failed, using original frame fallback for window [{window_start}, {window_end})")
+                        # Restore model to FP16 after failed retry
+                        if use_fp16:
+                            model.half()
                         _cleanup_memory(verbose=True)
                         for i, idx in enumerate(neighbor_ids):
                             _write_or_average_frame(frame_paths, output_dir, idx, None, mask_3ch, frame_count)
                     else:
+                        # Restore model to FP16 before re-raising
+                        if use_fp16:
+                            model.half()
                         raise
             else:
+                # Restore model to FP16 before re-raising non-OOM errors
+                if use_fp16:
+                    model.half()
                 raise
 
         # ====== Memory cleanup (end of window) ======
@@ -1399,7 +1427,7 @@ def _save_flow_cache(cache_path: str, flows_list, frame_count: int, resize_to, r
 
 
 def _load_flow_cache(cache_path: str, frame_count: int, resize_to, raft_iter: int):
-    """Load precomputed flows from disk. Returns None if cache is invalid."""
+    """Load precomputed flows from disk. Returns None if cache is invalid or contains NaN."""
     if not os.path.exists(cache_path):
         return None
     try:
@@ -1407,8 +1435,19 @@ def _load_flow_cache(cache_path: str, frame_count: int, resize_to, raft_iter: in
         if (data.get('frame_count') == frame_count and
             data.get('resize_to') == resize_to and
             data.get('raft_iter') == raft_iter):
+            # Validate that cached flows do not contain NaN
+            flows_list = data['flows_list']
+            has_nan = False
+            for _, flows_f, flows_b in flows_list:
+                if torch.isnan(flows_f).any() or torch.isnan(flows_b).any():
+                    has_nan = True
+                    break
+            if has_nan:
+                print(f"  Flow cache contains NaN values, invalidating cache and recomputing...")
+                os.remove(cache_path)
+                return None
             print(f"  Loaded cached optical flow from: {cache_path}")
-            return data['flows_list']
+            return flows_list
         else:
             print(f"  Flow cache parameters mismatch, recomputing...")
             return None
