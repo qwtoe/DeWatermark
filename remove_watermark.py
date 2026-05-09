@@ -916,12 +916,15 @@ def process_chunks(
             if use_ref_frames and len(ref_ids) > 0:
                 ref_masks = mask_tensor[:, l_t:, :, :]
                 all_updated_masks = torch.cat([updated_masks, ref_masks], dim=1)
+                # Concatenate propagated local frames with original reference frames
+                full_updated_frames = torch.cat([updated_frames, frames_tensor[:, l_t:]], dim=1)
             else:
                 all_updated_masks = updated_masks
+                full_updated_frames = updated_frames
 
             with torch.inference_mode():
                 comp_frames = model(
-                    masked_frames=frames_tensor * (1 - mask_tensor),
+                    masked_frames=full_updated_frames,
                     completed_flows=(pred_flows_f, pred_flows_b),
                     masks_in=mask_tensor,
                     masks_updated=all_updated_masks,
@@ -986,12 +989,15 @@ def process_chunks(
                     if use_ref_frames and len(ref_ids) > 0:
                         ref_masks = mask_tensor[:, l_t:, :, :]
                         all_updated_masks = torch.cat([updated_masks, ref_masks], dim=1)
+                        # Concatenate propagated local frames with original reference frames
+                        full_updated_frames = torch.cat([updated_frames, frames_tensor[:, l_t:]], dim=1)
                     else:
                         all_updated_masks = updated_masks
+                        full_updated_frames = updated_frames
 
                     with torch.inference_mode():
                         comp_frames = model(
-                            masked_frames=frames_tensor * (1 - mask_tensor),
+                            masked_frames=full_updated_frames,
                             completed_flows=(pred_flows_f, pred_flows_b),
                             masks_in=mask_tensor,
                             masks_updated=all_updated_masks,
