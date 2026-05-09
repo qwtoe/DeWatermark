@@ -772,9 +772,28 @@ def _save_debug_tensor(tensor_or_np, path, label="", is_mask=False, is_result=Fa
         is_result: If True, tensor is in [0,255] uint8 range (post-processed result)
     """
     if isinstance(tensor_or_np, torch.Tensor):
-        arr = tensor_or_np.detach().float().cpu().numpy()
+        raw = tensor_or_np.detach().float()
+        arr = raw.cpu().numpy()
+        has_nan = torch.isnan(raw).any().item()
+        has_inf = torch.isinf(raw).any().item()
     else:
         arr = tensor_or_np.copy()
+        has_nan = np.isnan(arr).any()
+        has_inf = np.isinf(arr).any()
+
+    # Print detailed statistics
+    if label:
+        nan_inf_str = ""
+        if has_nan:
+            nan_inf_str += " [HAS NaN!]"
+        if has_inf:
+            nan_inf_str += " [HAS Inf!]"
+        print(f"  [DEBUG] {label}: shape={tensor_or_np.shape if isinstance(tensor_or_np, torch.Tensor) else arr.shape}, "
+              f"min={arr.min():.4f}, max={arr.max():.4f}, mean={arr.mean():.4f}{nan_inf_str}")
+
+    if has_nan or has_inf:
+        # Replace NaN/Inf with 0 for visualization
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Handle different shapes - take first frame
     if arr.ndim == 5:  # (1, T, C, H, W) or (B, T, C, H, W)
@@ -797,13 +816,48 @@ def _save_debug_tensor(tensor_or_np, path, label="", is_mask=False, is_result=Fa
         # [-1, 1] range -> [0, 255]
         arr = ((arr + 1.0) / 2.0 * 255).clip(0, 255).astype(np.uint8)
 
-    # Print statistics
-    if label:
-        print(f"  [DEBUG] {label}: shape={tensor_or_np.shape if isinstance(tensor_or_np, torch.Tensor) else arr.shape}, "
-              f"min={arr.min()}, max={arr.max()}, mean={arr.mean():.1f}")
-
     os.makedirs(os.path.dirname(path), exist_ok=True)
     cv2.imwrite(path, cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+
+
+def _save_debug_flow(flows, path, label=""):
+    """
+    Save optical flow magnitude as a debug image.
+
+    Args:
+        flows: tuple of (flows_forward, flows_backward), each shape (1, T-1, 2, H, W)
+        path: Output file path
+        label: Label to print with statistics
+    """
+    flows_f, flows_b = flows
+    if isinstance(flows_f, torch.Tensor):
+        flows_f = flows_f.detach().float().cpu().numpy()
+    if isinstance(flows_b, torch.Tensor):
+        flows_b = flows_b.detach().float().cpu().numpy()
+
+    # Compute magnitude of first forward flow
+    # flows_f shape: (1, T-1, 2, H, W)
+    f = flows_f[0, 0]  # (2, H, W)
+    mag_f = np.sqrt(f[0] ** 2 + f[1] ** 2)
+
+    b = flows_b[0, 0]  # (2, H, W)
+    mag_b = np.sqrt(b[0] ** 2 + b[1] ** 2)
+
+    if label:
+        print(f"  [DEBUG] {label} forward: shape={flows_f.shape}, mag_min={mag_f.min():.2f}, mag_max={mag_f.max():.2f}, mag_mean={mag_f.mean():.2f}")
+        print(f"  [DEBUG] {label} backward: shape={flows_b.shape}, mag_min={mag_b.min():.2f}, mag_max={mag_b.max():.2f}, mag_mean={mag_b.mean():.2f}")
+
+    # Normalize and save
+    def mag_to_img(mag):
+        mag_norm = mag / (mag.max() + 1e-6) * 255
+        return mag_norm.clip(0, 255).astype(np.uint8)
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Save forward flow magnitude
+    cv2.imwrite(path, mag_to_img(mag_f))
+    # Save backward flow magnitude next to it
+    base, ext = os.path.splitext(path)
+    cv2.imwrite(base + "_backward" + ext, mag_to_img(mag_b))
 
 
 def process_chunks(
@@ -969,13 +1023,20 @@ def process_chunks(
                 )
                 torch.cuda.empty_cache()
 
-                updated_frames = local_frames_tensor * (1 - local_mask) + \
-                                 updated_frames.view(local_frames_tensor.shape) * local_mask
-
-            # Debug: save image propagation results
+            # Debug: save raw img_propagation output before blending
             if debug_dir and is_first_window:
+                _save_debug_tensor(local_frames_tensor, os.path.join(debug_dir, "debug0_frames_tensor.png"), "local_frames_tensor (model input frames)")
+                _save_debug_tensor(local_mask, os.path.join(debug_dir, "debug0_mask_tensor.png"), "local_mask (model input mask)", is_mask=True)
+                _save_debug_flow((pred_flows_f, pred_flows_b), os.path.join(debug_dir, "debug0_flow_forward.png"), "optical_flow")
                 _save_debug_tensor(masked_frames, os.path.join(debug_dir, "step1_masked_input.png"), "masked_frames (input to img_propagation)")
-                _save_debug_tensor(updated_frames, os.path.join(debug_dir, "step2_propagated.png"), "updated_frames (output of img_propagation)")
+                _save_debug_tensor(updated_frames, os.path.join(debug_dir, "step2a_raw_propagation.png"), "raw img_propagation output (before blending)")
+
+            updated_frames = local_frames_tensor * (1 - local_mask) + \
+                             updated_frames.view(local_frames_tensor.shape) * local_mask
+
+            # Debug: save blended propagation result
+            if debug_dir and is_first_window:
+                _save_debug_tensor(updated_frames, os.path.join(debug_dir, "step2b_propagated_blended.png"), "updated_frames (after blending with original)")
 
             # ====== Step 4: Transformer inference ======
             if use_ref_frames and len(ref_ids) > 0:
@@ -1061,8 +1122,12 @@ def process_chunks(
                             masked_frames, (pred_flows_f, pred_flows_b), local_mask, "nearest"
                         )
                         torch.cuda.empty_cache()
-                        updated_frames = local_frames_tensor * (1 - local_mask) + \
-                                         updated_frames.view(local_frames_tensor.shape) * local_mask
+
+                    if debug_dir and is_first_window:
+                        _save_debug_tensor(updated_frames, os.path.join(debug_dir, "step2a_raw_propagation_retry.png"), "raw img_propagation output (OOM retry, before blending)")
+
+                    updated_frames = local_frames_tensor * (1 - local_mask) + \
+                                     updated_frames.view(local_frames_tensor.shape) * local_mask
 
                     if use_ref_frames and len(ref_ids) > 0:
                         ref_masks = mask_tensor[:, l_t:, :, :]

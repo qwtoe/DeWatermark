@@ -11,3 +11,4 @@ output_clean.mp4
 *.tmp.mp4
 *.mp4
 AGENTS.md
+debug_output/
