@@ -760,6 +760,52 @@ def _cleanup_memory(verbose: bool = False):
             print(f"  [Memory cleanup] Allocated: {alloc:.2f}GB, Reserved: {reserved:.2f}GB")
 
 
+def _save_debug_tensor(tensor_or_np, path, label="", is_mask=False, is_result=False):
+    """
+    Save a debug image from a tensor or numpy array.
+
+    Args:
+        tensor_or_np: torch.Tensor or numpy array to save
+        path: Output file path
+        label: Label to print with statistics
+        is_mask: If True, tensor is in [0,1] range; if False, in [-1,1] range
+        is_result: If True, tensor is in [0,255] uint8 range (post-processed result)
+    """
+    if isinstance(tensor_or_np, torch.Tensor):
+        arr = tensor_or_np.detach().float().cpu().numpy()
+    else:
+        arr = tensor_or_np.copy()
+
+    # Handle different shapes - take first frame
+    if arr.ndim == 5:  # (1, T, C, H, W) or (B, T, C, H, W)
+        arr = arr[0, 0]
+    elif arr.ndim == 4:  # (1, C, H, W) or (T, C, H, W)
+        arr = arr[0] if arr.shape[0] in (1, 3) else arr[0]
+
+    # (C, H, W) -> (H, W, C)
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):
+        arr = arr.transpose(1, 2, 0)
+
+    # Convert to uint8
+    if is_result:
+        # Already in [0, 255] range
+        arr = arr.astype(np.uint8)
+    elif is_mask:
+        # [0, 1] range -> [0, 255]
+        arr = (arr * 255).clip(0, 255).astype(np.uint8)
+    else:
+        # [-1, 1] range -> [0, 255]
+        arr = ((arr + 1.0) / 2.0 * 255).clip(0, 255).astype(np.uint8)
+
+    # Print statistics
+    if label:
+        print(f"  [DEBUG] {label}: shape={tensor_or_np.shape if isinstance(tensor_or_np, torch.Tensor) else arr.shape}, "
+              f"min={arr.min()}, max={arr.max()}, mean={arr.mean():.1f}")
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    cv2.imwrite(path, cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+
+
 def process_chunks(
     frame_paths: List[str],
     mask: np.ndarray,
@@ -774,6 +820,7 @@ def process_chunks(
     neighbor_length: Optional[int] = None,
     ref_stride: int = 10,
     max_ref_frames: int = 0,
+    debug_dir: Optional[str] = None,
 ) -> None:
     """
     Sliding window inference — core processing function.
@@ -847,6 +894,19 @@ def process_chunks(
     # frame_count dict tracks how many times each frame was written (for overlap averaging)
     frame_count: Dict[int, int] = {}
 
+    # Debug: save mask overlay on first frame
+    if debug_dir:
+        first_frame = cv2.imread(frame_paths[0])
+        if first_frame is not None:
+            first_frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+            mask_overlay = first_frame_rgb.copy()
+            mask_bool = mask > 128
+            mask_overlay[mask_bool] = (mask_overlay[mask_bool] * 0.5 + np.array([255, 0, 0]) * 0.5).astype(np.uint8)
+            cv2.imwrite(os.path.join(debug_dir, "step0_mask_overlay.png"), cv2.cvtColor(mask_overlay, cv2.COLOR_RGB2BGR))
+        _save_debug_tensor(torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).unsqueeze(0).float() / 255.0,
+                          os.path.join(debug_dir, "step0_mask.png"), "mask", is_mask=True)
+
+    is_first_window = True
     pbar = tqdm(total=total_frames, desc="Inference progress", unit="frame")
 
     for window_start in range(0, total_frames, neighbor_stride):
@@ -912,6 +972,11 @@ def process_chunks(
                 updated_frames = local_frames_tensor * (1 - local_mask) + \
                                  updated_frames.view(local_frames_tensor.shape) * local_mask
 
+            # Debug: save image propagation results
+            if debug_dir and is_first_window:
+                _save_debug_tensor(masked_frames, os.path.join(debug_dir, "step1_masked_input.png"), "masked_frames (input to img_propagation)")
+                _save_debug_tensor(updated_frames, os.path.join(debug_dir, "step2_propagated.png"), "updated_frames (output of img_propagation)")
+
             # ====== Step 4: Transformer inference ======
             if use_ref_frames and len(ref_ids) > 0:
                 ref_masks = mask_tensor[:, l_t:, :, :]
@@ -932,6 +997,11 @@ def process_chunks(
                 )
                 torch.cuda.empty_cache()
 
+            # Debug: save transformer input/output
+            if debug_dir and is_first_window:
+                _save_debug_tensor(full_updated_frames if 'full_updated_frames' in dir() else updated_frames, os.path.join(debug_dir, "step3_transformer_input.png"), "transformer input (full_updated_frames)")
+                _save_debug_tensor(comp_frames, os.path.join(debug_dir, "step4_transformer_output.png"), "transformer output (comp_frames)")
+
             # ====== Step 5: Post-processing ======
             result_np = comp_frames.squeeze(0).float().cpu().numpy()
             result_np = (result_np + 1.0) / 2.0
@@ -945,6 +1015,10 @@ def process_chunks(
                     resized_results.append(img)
                 result_np = np.stack(resized_results)
 
+            # Debug: save post-processed result
+            if debug_dir and is_first_window:
+                _save_debug_tensor(result_np[0:1], os.path.join(debug_dir, "step5_result.png"), "result_np (post-processed)", is_result=True)
+
             # Blend and write to disk
             for i, idx in enumerate(neighbor_ids):
                 orig_frame = cv2.imread(frame_paths[idx])
@@ -956,6 +1030,10 @@ def process_chunks(
                 blended = result_np[i].astype(accum_dtype) * mask_3ch + \
                           orig_frame.astype(accum_dtype) * (1 - mask_3ch)
                 blended = blended.astype(np.uint8)
+
+                # Debug: save blended result for first frame
+                if debug_dir and is_first_window and i == 0:
+                    _save_debug_tensor(blended, os.path.join(debug_dir, "step6_blended.png"), "blended (final output)", is_result=True)
 
                 _write_or_average_frame(frame_paths, output_dir, idx, blended, mask_3ch, frame_count)
 
@@ -1048,6 +1126,8 @@ def process_chunks(
         _cleanup_memory(verbose=(window_start % (neighbor_stride * 10) == 0))
 
         pbar.update(len(neighbor_ids))
+
+        is_first_window = False
 
     pbar.close()
 
@@ -1194,6 +1274,48 @@ def cleanup_temp(*dirs: str) -> None:
                 print(f"  Cleanup failed {d}: {e}")
 
 
+def _get_flow_cache_path(input_path: str, resize_to, raft_iter: int) -> str:
+    """Generate a flow cache file path based on input video and parameters."""
+    import hashlib
+    video_name = os.path.splitext(os.path.basename(input_path))[0]
+    # Include resize and raft_iter in the cache key
+    resize_str = str(resize_to) if resize_to else "original"
+    cache_key = f"{video_name}_resize{resize_str}_raft{raft_iter}"
+    # Hash to avoid very long filenames
+    hash_key = hashlib.md5(cache_key.encode()).hexdigest()[:12]
+    return os.path.join(os.path.dirname(input_path) or ".", f".flow_cache_{hash_key}.pt")
+
+
+def _save_flow_cache(cache_path: str, flows_list, frame_count: int, resize_to, raft_iter: int):
+    """Save precomputed flows to disk."""
+    print(f"  Caching optical flow to: {cache_path}")
+    torch.save({
+        'flows_list': flows_list,
+        'frame_count': frame_count,
+        'resize_to': resize_to,
+        'raft_iter': raft_iter,
+    }, cache_path)
+
+
+def _load_flow_cache(cache_path: str, frame_count: int, resize_to, raft_iter: int):
+    """Load precomputed flows from disk. Returns None if cache is invalid."""
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        data = torch.load(cache_path, map_location='cpu', weights_only=False)
+        if (data.get('frame_count') == frame_count and
+            data.get('resize_to') == resize_to and
+            data.get('raft_iter') == raft_iter):
+            print(f"  Loaded cached optical flow from: {cache_path}")
+            return data['flows_list']
+        else:
+            print(f"  Flow cache parameters mismatch, recomputing...")
+            return None
+    except Exception as e:
+        print(f"  Flow cache load failed: {e}, recomputing...")
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="DeWatermark — Video Watermark Removal with ProPainter (VRAM ≥ 4 GB)",
@@ -1259,6 +1381,10 @@ Usage examples:
                         help="Keep temp files (debugging)")
     parser.add_argument("--force-mask", action="store_true",
                         help="Force regenerate Mask (ignore existing mask.png)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Save intermediate debug images for each pipeline step")
+    parser.add_argument("--cache-flows", action="store_true",
+                        help="Cache precomputed optical flows to disk for reuse (saves time on re-runs)")
 
     args = parser.parse_args()
 
@@ -1412,19 +1538,32 @@ Usage examples:
             )
 
             # ====== Step 3b: Precompute optical flow ======
-            print(f"\n[Step 3b/5] Precomputing full video optical flow...")
-            flows_list = precompute_all_flows(
-                frame_paths=frame_paths,
-                mask=mask,
-                flow_mask=flow_mask,
-                resize_to=args.resize if isinstance(args.resize, int) else None,
-                fix_raft=fix_raft,
-                fix_flow_complete=fix_flow_complete,
-                raft_iter=args.raft_iter,
-                use_fp16=use_fp16,
-                device=device_str,
-                chunk_size=args.chunk_size,
-            )
+            resize_to_val = args.resize if isinstance(args.resize, int) else None
+            flow_cache_path = _get_flow_cache_path(args.input, resize_to_val, args.raft_iter) if args.cache_flows else None
+            flows_list = None
+
+            if flow_cache_path:
+                flows_list = _load_flow_cache(flow_cache_path, len(frame_paths), resize_to_val, args.raft_iter)
+
+            if flows_list is None:
+                print(f"\n[Step 3b/5] Precomputing full video optical flow...")
+                flows_list = precompute_all_flows(
+                    frame_paths=frame_paths,
+                    mask=mask,
+                    flow_mask=flow_mask,
+                    resize_to=resize_to_val,
+                    fix_raft=fix_raft,
+                    fix_flow_complete=fix_flow_complete,
+                    raft_iter=args.raft_iter,
+                    use_fp16=use_fp16,
+                    device=device_str,
+                    chunk_size=args.chunk_size,
+                )
+
+                if flow_cache_path:
+                    _save_flow_cache(flow_cache_path, flows_list, len(frame_paths), resize_to_val, args.raft_iter)
+            else:
+                print(f"\n[Step 3b/5] Using cached optical flow (skipped computation)")
 
             # Release RAFT model (no longer needed)
             print("  Releasing RAFT model...")
@@ -1433,6 +1572,14 @@ Usage examples:
 
             # ====== Step 4: Sliding window inference ======
             print(f"\n[Step 4/5] Starting watermark removal inference (using precomputed optical flow)...")
+
+            # Create debug directory if --debug is enabled
+            debug_dir = None
+            if args.debug:
+                debug_dir = os.path.join(os.path.dirname(args.output) or ".", "debug_output")
+                os.makedirs(debug_dir, exist_ok=True)
+                print(f"  Debug images will be saved to: {debug_dir}")
+
             process_chunks(
                 frame_paths=frame_paths,
                 mask=mask,
@@ -1447,6 +1594,7 @@ Usage examples:
                 neighbor_length=args.neighbor_length,
                 ref_stride=args.ref_stride,
                 max_ref_frames=args.max_ref_frames,
+                debug_dir=debug_dir,
             )
 
             # Release models
