@@ -583,6 +583,11 @@ def precompute_all_flows(
         local_frames = frames_tensor[:, :l_t, :, :, :]
 
         # ---- Compute optical flow + completion ----
+        # NOTE: Flow completion network is numerically unstable in FP16 (produces NaN).
+        # We force FP32 for the entire flow computation pipeline, then convert back to
+        # FP16 only for storage if needed.
+        fix_flow_complete_fp32 = fix_flow_complete.float() if use_fp16 else fix_flow_complete
+
         try:
             with torch.inference_mode():
                 video_length = local_frames.size(1)
@@ -597,6 +602,7 @@ def precompute_all_flows(
                 else:
                     short_clip_len = 2
 
+                # RAFT must run in FP32 for numerical stability
                 raft_input = local_frames.float()
 
                 if video_length > short_clip_len:
@@ -624,13 +630,17 @@ def precompute_all_flows(
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
-                if use_fp16:
-                    gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
-                    torch.cuda.empty_cache()
+                # Keep flows in FP32 for flow completion (FP16 causes NaN)
+                # Flow completion must run in FP32 for numerical stability
+                flow_mask_fp32 = flow_mask_tensor.float()
+                gt_flows_f_fp32 = gt_flows_bi[0].float()
+                gt_flows_b_fp32 = gt_flows_bi[1].float()
+                gt_flows_bi_fp32 = (gt_flows_f_fp32, gt_flows_b_fp32)
+                del gt_flows_bi
 
-                # Flow completion
+                # Flow completion (FP32)
                 subvideo_length = 80
-                flow_length = gt_flows_bi[0].size(1)
+                flow_length = gt_flows_bi_fp32[0].size(1)
 
                 if flow_length > subvideo_length:
                     pred_flows_f, pred_flows_b = [], []
@@ -641,14 +651,14 @@ def precompute_all_flows(
                         pad_len_s = max(0, f) - s_f
                         pad_len_e = e_f - min(flow_length, f + subvideo_length)
 
-                        pred_flows_bi_sub, _ = fix_flow_complete.forward_bidirect_flow(
-                            (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
-                            flow_mask_tensor[:, s_f:e_f + 1]
+                        pred_flows_bi_sub, _ = fix_flow_complete_fp32.forward_bidirect_flow(
+                            (gt_flows_bi_fp32[0][:, s_f:e_f], gt_flows_bi_fp32[1][:, s_f:e_f]),
+                            flow_mask_fp32[:, s_f:e_f + 1]
                         )
-                        pred_flows_bi_sub = fix_flow_complete.combine_flow(
-                            (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
+                        pred_flows_bi_sub = fix_flow_complete_fp32.combine_flow(
+                            (gt_flows_bi_fp32[0][:, s_f:e_f], gt_flows_bi_fp32[1][:, s_f:e_f]),
                             pred_flows_bi_sub,
-                            flow_mask_tensor[:, s_f:e_f + 1]
+                            flow_mask_fp32[:, s_f:e_f + 1]
                         )
                         pred_flows_f.append(pred_flows_bi_sub[0][:, pad_len_s:e_f - s_f - pad_len_e])
                         pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s:e_f - s_f - pad_len_e])
@@ -657,14 +667,23 @@ def precompute_all_flows(
                     pred_flows_f = torch.cat(pred_flows_f, dim=1)
                     pred_flows_b = torch.cat(pred_flows_b, dim=1)
                 else:
-                    pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_mask_tensor)
-                    pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_mask_tensor)
+                    pred_flows_bi, _ = fix_flow_complete_fp32.forward_bidirect_flow(gt_flows_bi_fp32, flow_mask_fp32)
+                    pred_flows_bi = fix_flow_complete_fp32.combine_flow(gt_flows_bi_fp32, pred_flows_bi, flow_mask_fp32)
                     pred_flows_f = pred_flows_bi[0]
                     pred_flows_b = pred_flows_bi[1]
                     torch.cuda.empty_cache()
 
-                del gt_flows_bi
+                del gt_flows_bi_fp32
                 torch.cuda.empty_cache()
+
+                # Check for NaN in completed flows (early detection)
+                if torch.isnan(pred_flows_f).any() or torch.isnan(pred_flows_b).any():
+                    nan_f = torch.isnan(pred_flows_f).sum().item()
+                    nan_b = torch.isnan(pred_flows_b).sum().item()
+                    print(f"\n  WARNING: NaN detected in completed flows! forward={nan_f}, backward={nan_b}")
+                    # Replace NaN with zero (will be handled by downstream models)
+                    pred_flows_f = torch.nan_to_num(pred_flows_f, nan=0.0)
+                    pred_flows_b = torch.nan_to_num(pred_flows_b, nan=0.0)
 
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
@@ -676,13 +695,15 @@ def precompute_all_flows(
                     gt_flows_bi = fix_raft(raft_input, iters=raft_iter)
                     del raft_input
                     torch.cuda.empty_cache()
-                    if use_fp16:
-                        gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
-                    pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_mask_tensor)
-                    pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_mask_tensor)
+                    # Keep in FP32 for flow completion
+                    gt_flows_bi_fp32 = (gt_flows_bi[0].float(), gt_flows_bi[1].float())
+                    del gt_flows_bi
+                    flow_mask_fp32 = flow_mask_tensor.float()
+                    pred_flows_bi, _ = fix_flow_complete_fp32.forward_bidirect_flow(gt_flows_bi_fp32, flow_mask_fp32)
+                    pred_flows_bi = fix_flow_complete_fp32.combine_flow(gt_flows_bi_fp32, pred_flows_bi, flow_mask_fp32)
                     pred_flows_f = pred_flows_bi[0]
                     pred_flows_b = pred_flows_bi[1]
-                    del gt_flows_bi
+                    del gt_flows_bi_fp32
                     torch.cuda.empty_cache()
             else:
                 raise
@@ -702,6 +723,11 @@ def precompute_all_flows(
         pbar.update(actual_num_flows)
 
     pbar.close()
+
+    # Restore flow completion model to original precision (FP16 if it was converted)
+    if use_fp16:
+        fix_flow_complete.half()
+
     print(f"Flow precomputation complete: {len(flows_list)} chunks")
     return flows_list
 
@@ -1011,6 +1037,16 @@ def process_chunks(
         try:
             pred_flows_f = pred_flows_f_cpu.to(device_obj)
             pred_flows_b = pred_flows_b_cpu.to(device_obj)
+
+            # Check for NaN in flows (early detection of flow computation issues)
+            if torch.isnan(pred_flows_f).any() or torch.isnan(pred_flows_b).any():
+                nan_f = torch.isnan(pred_flows_f).sum().item()
+                nan_b = torch.isnan(pred_flows_b).sum().item()
+                print(f"\n  WARNING: NaN in precomputed flows! forward={nan_f}, backward={nan_b}")
+                print(f"  Replacing NaN with zero...")
+                pred_flows_f = torch.nan_to_num(pred_flows_f, nan=0.0)
+                pred_flows_b = torch.nan_to_num(pred_flows_b, nan=0.0)
+
             if use_fp16:
                 pred_flows_f = pred_flows_f.half()
                 pred_flows_b = pred_flows_b.half()
